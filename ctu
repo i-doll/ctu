@@ -1,0 +1,501 @@
+#!/usr/bin/env bash
+# <ID> Claude JSONL Token Usage Scanner
+# Scans Claude CLI log files and calculates token usage with cost estimates.
+# Replicates the logic from CostUsageScanner+Claude.swift in bash.
+
+set -euo pipefail
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+VERSION="1.0.0"
+
+# Default Claude projects directories
+DEFAULT_DIRS=(
+    "$HOME/.config/claude/projects"
+    "$HOME/.claude/projects"
+)
+
+# ============================================================================
+# Pricing Table (from CostUsagePricing.swift)
+# Format: model_pattern|input_per_token|output_per_token|cache_create_per_token|cache_read_per_token
+# ============================================================================
+
+declare -a PRICING_TABLE=(
+    # Sonnet 4.5 variants
+    "claude-sonnet-4-5|0.000003|0.000015|0.00000375|0.0000003"
+    # Opus 4.5 variants
+    "claude-opus-4-5|0.000005|0.000025|0.00000625|0.0000005"
+    # Opus 4.1 / Opus 4-20250514
+    "claude-opus-4-1|0.000015|0.000075|0.00001875|0.0000015"
+    "claude-opus-4-20250514|0.000015|0.000075|0.00001875|0.0000015"
+    # Haiku 4.5 variants
+    "claude-haiku-4-5|0.000001|0.000005|0.00000125|0.0000001"
+    # Sonnet 4-20250514 (same as sonnet-4-5)
+    "claude-sonnet-4-20250514|0.000003|0.000015|0.00000375|0.0000003"
+)
+
+# ============================================================================
+# Argument Parsing
+# ============================================================================
+
+SHOW_DAILY=true
+SHOW_MODEL=false
+SHOW_TOTAL=false
+SINCE_DATE=""
+UNTIL_DATE=""
+JSON_OUTPUT=false
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Scan Claude CLI JSONL log files and calculate token usage with cost estimates.
+
+Options:
+  -d, --daily         Show daily breakdown (default)
+  -m, --by-model      Include per-model breakdown
+  -t, --total         Show only total summary
+  -s, --since DATE    Filter from date (YYYY-MM-DD)
+  -u, --until DATE    Filter until date (YYYY-MM-DD)
+  -j, --json          Output as JSON
+  -v, --version       Show version
+  -h, --help          Show this help
+
+Examples:
+  $(basename "$0")                    # Daily breakdown for all time
+  $(basename "$0") -m                 # Daily + per-model breakdown
+  $(basename "$0") -t                 # Total summary only
+  $(basename "$0") -s 2025-02-01      # Since February 1st
+  $(basename "$0") -s 2025-02-01 -u 2025-02-05 -j  # Date range, JSON output
+
+Environment:
+  CLAUDE_CONFIG_DIR   Override default log directories (comma-separated)
+EOF
+    exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--daily)
+            SHOW_DAILY=true
+            SHOW_TOTAL=false
+            shift
+            ;;
+        -m|--by-model)
+            SHOW_MODEL=true
+            shift
+            ;;
+        -t|--total)
+            SHOW_TOTAL=true
+            SHOW_DAILY=false
+            shift
+            ;;
+        -s|--since)
+            SINCE_DATE="$2"
+            shift 2
+            ;;
+        -u|--until)
+            UNTIL_DATE="$2"
+            shift 2
+            ;;
+        -j|--json)
+            JSON_OUTPUT=true
+            shift
+            ;;
+        -v|--version)
+            echo "claude-token-usage v$VERSION"
+            exit 0
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            echo "Use -h for help" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# ============================================================================
+# Dependency Check
+# ============================================================================
+
+check_deps() {
+    local missing=()
+    command -v jq >/dev/null 2>&1 || missing+=("jq")
+    command -v awk >/dev/null 2>&1 || missing+=("awk")
+    
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo "Error: Missing required dependencies: ${missing[*]}" >&2
+        echo "Install with: sudo apt install ${missing[*]}" >&2
+        exit 1
+    fi
+}
+
+check_deps
+
+# ============================================================================
+# Directory Discovery
+# ============================================================================
+
+get_log_dirs() {
+    local dirs=()
+    
+    if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+        # Honor CLAUDE_CONFIG_DIR environment variable
+        IFS=',' read -ra parts <<< "$CLAUDE_CONFIG_DIR"
+        for part in "${parts[@]}"; do
+            part="${part#"${part%%[![:space:]]*}"}"  # trim leading
+            part="${part%"${part##*[![:space:]]}"}"  # trim trailing
+            [[ -z "$part" ]] && continue
+            
+            if [[ "$(basename "$part")" == "projects" ]]; then
+                dirs+=("$part")
+            else
+                dirs+=("$part/projects")
+            fi
+        done
+    else
+        dirs=("${DEFAULT_DIRS[@]}")
+    fi
+    
+    # Filter to existing directories
+    for dir in "${dirs[@]}"; do
+        [[ -d "$dir" ]] && echo "$dir"
+    done
+}
+
+# ============================================================================
+# Model Name Normalization (matches CostUsagePricing.normalizeClaudeModel)
+# ============================================================================
+
+normalize_model() {
+    local model="$1"
+    
+    # Strip anthropic. prefix
+    model="${model#anthropic.}"
+    
+    # Strip version suffix like -v1:0
+    model=$(echo "$model" | sed -E 's/-v[0-9]+:[0-9]+$//')
+    
+    # Strip Vertex AI @ version separator
+    model="${model%%@*}"
+    
+    echo "$model"
+}
+
+# ============================================================================
+# Pricing Lookup
+# ============================================================================
+
+get_pricing() {
+    local model="$1"
+    local normalized
+    normalized=$(normalize_model "$model")
+    
+    for entry in "${PRICING_TABLE[@]}"; do
+        local pattern="${entry%%|*}"
+        if [[ "$normalized" == "$pattern"* ]]; then
+            echo "${entry#*|}"
+            return 0
+        fi
+    done
+    
+    # Default to sonnet pricing if unknown
+    echo "0.000003|0.000015|0.00000375|0.0000003"
+}
+
+# ============================================================================
+# Main Processing Pipeline
+# ============================================================================
+
+# Build jq filter for extracting usage data
+JQ_FILTER='
+select(.type == "assistant" and .message.usage != null) |
+{
+  day: (.timestamp | split("T")[0]),
+  req_id: (.requestId // ""),
+  msg_id: (.message.id // ""),
+  model: (.message.model // "unknown"),
+  input: (.message.usage.input_tokens // 0),
+  output: (.message.usage.output_tokens // 0),
+  cache_create: (.message.usage.cache_creation_input_tokens // 0),
+  cache_read: (.message.usage.cache_read_input_tokens // 0)
+} |
+[.day, .req_id, .msg_id, .model, .input, .output, .cache_create, .cache_read] |
+@tsv
+'
+
+# AWK script for deduplication, aggregation, and cost calculation
+read -r -d '' AWK_SCRIPT << 'AWKEOF' || true
+BEGIN {
+    FS = "\t"
+    OFS = "\t"
+    
+    # Pricing table (model_prefix -> input|output|cache_create|cache_read)
+    pricing["claude-sonnet-4-5"] = "0.000003|0.000015|0.00000375|0.0000003"
+    pricing["claude-opus-4-5"] = "0.000005|0.000025|0.00000625|0.0000005"
+    pricing["claude-opus-4-1"] = "0.000015|0.000075|0.00001875|0.0000015"
+    pricing["claude-opus-4-20250514"] = "0.000015|0.000075|0.00001875|0.0000015"
+    pricing["claude-haiku-4-5"] = "0.000001|0.000005|0.00000125|0.0000001"
+    pricing["claude-sonnet-4-20250514"] = "0.000003|0.000015|0.00000375|0.0000003"
+}
+
+function normalize_model(m) {
+    # Strip anthropic. prefix
+    sub(/^anthropic\./, "", m)
+    # Strip version suffix
+    sub(/-v[0-9]+:[0-9]+$/, "", m)
+    # Strip Vertex AI @ version
+    sub(/@.*$/, "", m)
+    return m
+}
+
+function get_cost(model, input, output, cache_create, cache_read) {
+    norm = normalize_model(model)
+    
+    # Find matching pricing
+    p = ""
+    for (prefix in pricing) {
+        if (index(norm, prefix) == 1) {
+            p = pricing[prefix]
+            break
+        }
+    }
+    
+    # Default to sonnet pricing
+    if (p == "") p = "0.000003|0.000015|0.00000375|0.0000003"
+    
+    split(p, rates, "|")
+    cost = (input * rates[1]) + (output * rates[2]) + (cache_create * rates[3]) + (cache_read * rates[4])
+    return cost
+}
+
+function fmt_num(n) {
+    # Format numbers with shorthand: 1.2B, 365M, 30k
+    if (n < 0) return "-" fmt_num(-n)
+    if (n >= 1000000000) return sprintf("%.1fB", n / 1000000000)
+    if (n >= 1000000) return sprintf("%.1fM", n / 1000000)
+    if (n >= 1000) return sprintf("%.1fk", n / 1000)
+    return sprintf("%d", n)
+}
+
+{
+    day = $1
+    req_id = $2
+    msg_id = $3
+    model = $4
+    input = $5 + 0
+    output = $6 + 0
+    cache_create = $7 + 0
+    cache_read = $8 + 0
+    
+    # Date filtering
+    if (since != "" && day < since) next
+    if (until != "" && day > until) next
+    
+    # Deduplication by msg_id:req_id
+    if (msg_id != "" && req_id != "") {
+        key = msg_id ":" req_id
+        if (key in seen) next
+        seen[key] = 1
+    }
+    
+    # Aggregate by day
+    day_input[day] += input
+    day_output[day] += output
+    day_cache_create[day] += cache_create
+    day_cache_read[day] += cache_read
+    days[day] = 1
+    
+    # Aggregate by day+model
+    dm = day "\t" model
+    dm_input[dm] += input
+    dm_output[dm] += output
+    dm_cache_create[dm] += cache_create
+    dm_cache_read[dm] += cache_read
+    day_models[dm] = 1
+    
+    # Track models used per day
+    if (!(day in models_by_day)) {
+        models_by_day[day] = model
+    } else if (index(models_by_day[day], model) == 0) {
+        models_by_day[day] = models_by_day[day] "," model
+    }
+    
+    # Totals
+    total_input += input
+    total_output += output
+    total_cache_create += cache_create
+    total_cache_read += cache_read
+    
+    # Accumulate actual cost per model for accurate total
+    total_cost_actual += get_cost(model, input, output, cache_create, cache_read)
+}
+
+END {
+    # Sort days
+    n = asorti(days, sorted_days)
+    
+    if (json == "true") {
+        # JSON output
+        printf "{\n"
+        
+        # Daily array
+        printf "  \"daily\": [\n"
+        for (i = 1; i <= n; i++) {
+            day = sorted_days[i]
+            inp = day_input[day]
+            out = day_output[day]
+            cc = day_cache_create[day]
+            cr = day_cache_read[day]
+            total = inp + out + cc + cr
+            cost = get_cost("claude-sonnet-4-5", inp, out, cc, cr)
+            
+            printf "    {\"date\": \"%s\", \"input\": %d, \"output\": %d, \"cache_read\": %d, \"cache_create\": %d, \"total\": %d, \"cost_usd\": %.4f}", day, inp, out, cr, cc, total, cost
+            if (i < n) printf ","
+            printf "\n"
+        }
+        printf "  ],\n"
+        
+        # By model array (if requested)
+        if (show_model == "true") {
+            printf "  \"by_model\": [\n"
+            m = asorti(day_models, sorted_dm)
+            for (i = 1; i <= m; i++) {
+                dm = sorted_dm[i]
+                split(dm, parts, "\t")
+                day = parts[1]
+                model = parts[2]
+                inp = dm_input[dm]
+                out = dm_output[dm]
+                cc = dm_cache_create[dm]
+                cr = dm_cache_read[dm]
+                cost = get_cost(model, inp, out, cc, cr)
+                
+                printf "    {\"date\": \"%s\", \"model\": \"%s\", \"input\": %d, \"output\": %d, \"cache_read\": %d, \"cache_create\": %d, \"cost_usd\": %.4f}", day, model, inp, out, cr, cc, cost
+                if (i < m) printf ","
+                printf "\n"
+            }
+            printf "  ],\n"
+        }
+        
+        # Total (use accumulated per-model cost for accuracy)
+        total_tokens = total_input + total_output + total_cache_create + total_cache_read
+        printf "  \"total\": {\"input\": %d, \"output\": %d, \"cache_read\": %d, \"cache_create\": %d, \"total\": %d, \"cost_usd\": %.4f}\n", total_input, total_output, total_cache_read, total_cache_create, total_tokens, total_cost_actual
+        printf "}\n"
+    } else {
+        # Text output
+        if (show_daily == "true") {
+            # Header
+            printf "%-12s %8s %8s %8s %8s %8s %10s\n", "Date", "Input", "Output", "Cache-R", "Cache-C", "Total", "Cost"
+            printf "──────────────────────────────────────────────────────────────────────\n"
+            
+            for (i = 1; i <= n; i++) {
+                day = sorted_days[i]
+                inp = day_input[day]
+                out = day_output[day]
+                cc = day_cache_create[day]
+                cr = day_cache_read[day]
+                total = inp + out + cc + cr
+                cost = get_cost("claude-sonnet-4-5", inp, out, cc, cr)
+                
+                printf "%-12s %8s %8s %8s %8s %8s %9.2f\n", day, fmt_num(inp), fmt_num(out), fmt_num(cr), fmt_num(cc), fmt_num(total), cost
+            }
+            
+            printf "──────────────────────────────────────────────────────────────────────\n"
+        }
+        
+        # By model breakdown
+        if (show_model == "true") {
+            printf "\nPer-Model Breakdown:\n"
+            printf "%-12s %-28s %8s %8s %10s\n", "Date", "Model", "Input", "Output", "Cost"
+            printf "──────────────────────────────────────────────────────────────────────\n"
+            
+            m = asorti(day_models, sorted_dm)
+            for (i = 1; i <= m; i++) {
+                dm = sorted_dm[i]
+                split(dm, parts, "\t")
+                day = parts[1]
+                model = parts[2]
+                inp = dm_input[dm]
+                out = dm_output[dm]
+                cc = dm_cache_create[dm]
+                cr = dm_cache_read[dm]
+                cost = get_cost(model, inp, out, cc, cr)
+                
+                # Truncate model name if too long
+                if (length(model) > 26) model = substr(model, 1, 23) "..."
+                
+                printf "%-12s %-28s %8s %8s %9.2f\n", day, model, fmt_num(inp), fmt_num(out), cost
+            }
+            printf "──────────────────────────────────────────────────────────────────────\n"
+        }
+        
+        # Total summary (use accumulated per-model cost for accuracy)
+        total_tokens = total_input + total_output + total_cache_create + total_cache_read
+        
+        if (show_total == "true" || show_daily == "true") {
+            printf "%-12s %8s %8s %8s %8s %8s %9.2f\n", "TOTAL", fmt_num(total_input), fmt_num(total_output), fmt_num(total_cache_read), fmt_num(total_cache_create), fmt_num(total_tokens), total_cost_actual
+        }
+        
+        if (show_total == "true" && show_daily != "true") {
+            printf "\nTotal Token Usage:\n"
+            printf "  Input tokens:         %12s\n", fmt_num(total_input)
+            printf "  Output tokens:        %12s\n", fmt_num(total_output)
+            printf "  Cache read tokens:    %12s\n", fmt_num(total_cache_read)
+            printf "  Cache create tokens:  %12s\n", fmt_num(total_cache_create)
+            printf "  ─────────────────────────────────\n"
+            printf "  Total tokens:         %12s\n", fmt_num(total_tokens)
+            printf "  Estimated cost:       $%11.2f\n", total_cost_actual
+        }
+    }
+}
+AWKEOF
+
+# ============================================================================
+# Execute Pipeline
+# ============================================================================
+
+main() {
+    local log_dirs
+    log_dirs=$(get_log_dirs)
+    
+    if [[ -z "$log_dirs" ]]; then
+        echo "No Claude log directories found." >&2
+        echo "Checked: ${DEFAULT_DIRS[*]}" >&2
+        exit 1
+    fi
+    
+    # Find all JSONL files
+    local jsonl_files
+    jsonl_files=$(find $log_dirs -name "*.jsonl" -type f 2>/dev/null || true)
+    
+    if [[ -z "$jsonl_files" ]]; then
+        echo "No JSONL files found in Claude directories." >&2
+        exit 1
+    fi
+    
+    # Count files for progress indication (to stderr so it doesn't affect output)
+    local file_count
+    file_count=$(echo "$jsonl_files" | wc -l)
+    echo "Scanning $file_count JSONL files..." >&2
+    
+    # Process all files through jq, then aggregate with awk
+    echo "$jsonl_files" | while read -r file; do
+        # Use jq with --raw-output to handle each line, ignore parse errors
+        jq -r "$JQ_FILTER" "$file" 2>/dev/null || true
+    done | awk \
+        -v since="$SINCE_DATE" \
+        -v until="$UNTIL_DATE" \
+        -v json="$JSON_OUTPUT" \
+        -v show_daily="$SHOW_DAILY" \
+        -v show_model="$SHOW_MODEL" \
+        -v show_total="$SHOW_TOTAL" \
+        "$AWK_SCRIPT"
+}
+
+main "$@"

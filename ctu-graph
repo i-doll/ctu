@@ -1,0 +1,469 @@
+#!/usr/bin/env bash
+# ctu-graph — Claude Token Usage Bar Chart
+# Visualizes token usage as a horizontal terminal bar chart.
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# Default Claude projects directories
+DEFAULT_DIRS=(
+    "$HOME/.config/claude/projects"
+    "$HOME/.claude/projects"
+)
+
+# Pricing table (model_pattern|input|output|cache_create|cache_read per token)
+declare -a PRICING_TABLE=(
+    "claude-sonnet-4-5|0.000003|0.000015|0.00000375|0.0000003"
+    "claude-opus-4-5|0.000005|0.000025|0.00000625|0.0000005"
+    "claude-opus-4-1|0.000015|0.000075|0.00001875|0.0000015"
+    "claude-opus-4-20250514|0.000015|0.000075|0.00001875|0.0000015"
+    "claude-haiku-4-5|0.000001|0.000005|0.00000125|0.0000001"
+    "claude-sonnet-4-20250514|0.000003|0.000015|0.00000375|0.0000003"
+)
+
+# ============================================================================
+# Argument Parsing
+# ============================================================================
+
+DAY_FILTER=""
+SINCE_DATE=""
+UNTIL_DATE=""
+DAYS_LIMIT=30
+SPLIT_MODE=false
+OPT_NO_COLOR=false
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Visualize Claude token usage as a horizontal bar chart.
+
+Options:
+  -d, --day DATE      Hourly drill-down for YYYY-MM-DD
+  -s, --since DATE    Filter from date (daily mode only)
+  -u, --until DATE    Filter until date (daily mode only)
+  -n, --days N        Show last N days (default: 30; 0 = all time)
+      --split         Two sub-bars per row: input+cache | output
+      --no-color      Disable ANSI colors
+  -v, --version       Show version
+  -h, --help          Show help
+
+Examples:
+  $(basename "$0")                     # Daily chart, last 30 days
+  $(basename "$0") --split             # Split input/output bars
+  $(basename "$0") --day 2026-02-18    # Hourly view for that day
+  $(basename "$0") -s 2026-01-01       # From start of year
+  $(basename "$0") --no-color | tee out.txt
+EOF
+    exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--day)
+            DAY_FILTER="$2"
+            shift 2
+            ;;
+        -s|--since)
+            SINCE_DATE="$2"
+            shift 2
+            ;;
+        -u|--until)
+            UNTIL_DATE="$2"
+            shift 2
+            ;;
+        -n|--days)
+            DAYS_LIMIT="$2"
+            shift 2
+            ;;
+        --split)
+            SPLIT_MODE=true
+            shift
+            ;;
+        --no-color)
+            OPT_NO_COLOR=true
+            shift
+            ;;
+        -v|--version)
+            echo "ctu-graph v$VERSION"
+            exit 0
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            echo "Use -h for help" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# ============================================================================
+# Dependency Check
+# ============================================================================
+
+check_deps() {
+    local missing=()
+    command -v jq  >/dev/null 2>&1 || missing+=("jq")
+    command -v awk >/dev/null 2>&1 || missing+=("awk")
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo "Error: Missing required dependencies: ${missing[*]}" >&2
+        exit 1
+    fi
+}
+
+check_deps
+
+# ============================================================================
+# Directory Discovery
+# ============================================================================
+
+get_log_dirs() {
+    local dirs=()
+    if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+        IFS=',' read -ra parts <<< "$CLAUDE_CONFIG_DIR"
+        for part in "${parts[@]}"; do
+            part="${part#"${part%%[![:space:]]*}"}"
+            part="${part%"${part##*[![:space:]]}"}"
+            [[ -z "$part" ]] && continue
+            if [[ "$(basename "$part")" == "projects" ]]; then
+                dirs+=("$part")
+            else
+                dirs+=("$part/projects")
+            fi
+        done
+    else
+        dirs=("${DEFAULT_DIRS[@]}")
+    fi
+    for dir in "${dirs[@]}"; do
+        [[ -d "$dir" ]] && echo "$dir"
+    done
+}
+
+# ============================================================================
+# JQ Filter Builders
+# ============================================================================
+
+build_daily_filter() {
+    cat <<'JQEOF'
+select(.type == "assistant" and .message.usage != null) |
+{
+  period: (.timestamp | split("T")[0]),
+  req_id: (.requestId // ""),
+  msg_id: (.message.id // ""),
+  model:  (.message.model // "unknown"),
+  input:  (.message.usage.input_tokens // 0),
+  output: (.message.usage.output_tokens // 0),
+  cache_create: (.message.usage.cache_creation_input_tokens // 0),
+  cache_read:   (.message.usage.cache_read_input_tokens // 0)
+} |
+[.period, .req_id, .msg_id, .model, .input, .output, .cache_create, .cache_read] |
+@tsv
+JQEOF
+}
+
+build_hourly_filter() {
+    local day="$1"
+    # Embed the date via shell interpolation; day is YYYY-MM-DD from CLI arg
+    cat <<JQEOF
+select(.type == "assistant" and .message.usage != null and (.timestamp | startswith("${day}"))) |
+{
+  period: (.timestamp | split("T")[1] | split(":")[0]),
+  req_id: (.requestId // ""),
+  msg_id: (.message.id // ""),
+  model:  (.message.model // "unknown"),
+  input:  (.message.usage.input_tokens // 0),
+  output: (.message.usage.output_tokens // 0),
+  cache_create: (.message.usage.cache_creation_input_tokens // 0),
+  cache_read:   (.message.usage.cache_read_input_tokens // 0)
+} |
+[.period, .req_id, .msg_id, .model, .input, .output, .cache_create, .cache_read] |
+@tsv
+JQEOF
+}
+
+# ============================================================================
+# AWK Script
+# ============================================================================
+
+read -r -d '' AWK_SCRIPT << 'AWKEOF' || true
+BEGIN {
+    FS = "\t"
+
+    # Pricing table
+    pricing["claude-sonnet-4-5"]        = "0.000003|0.000015|0.00000375|0.0000003"
+    pricing["claude-opus-4-5"]          = "0.000005|0.000025|0.00000625|0.0000005"
+    pricing["claude-opus-4-1"]          = "0.000015|0.000075|0.00001875|0.0000015"
+    pricing["claude-opus-4-20250514"]   = "0.000015|0.000075|0.00001875|0.0000015"
+    pricing["claude-haiku-4-5"]         = "0.000001|0.000005|0.00000125|0.0000001"
+    pricing["claude-sonnet-4-20250514"] = "0.000003|0.000015|0.00000375|0.0000003"
+
+    # ANSI colors
+    if (colors_off == "true") {
+        C_RESET = ""; C_LABEL = ""; C_BAR_IN = ""; C_BAR_OUT = ""
+        C_DIM   = ""; C_COST  = ""; C_HDR    = ""
+    } else {
+        C_RESET   = "\033[0m"
+        C_LABEL   = "\033[1;37m"
+        C_BAR_IN  = "\033[34m"
+        C_BAR_OUT = "\033[32m"
+        C_DIM     = "\033[2;37m"
+        C_COST    = "\033[33m"
+        C_HDR     = "\033[1;36m"
+    }
+
+    # Layout
+    if (hourly_mode == "true") label_w = 2
+    else                       label_w = 10
+
+    # Stats column: "  1.234M in+c 1.234M out  $123.45" ≈ 33 visible chars
+    stats_w = 33
+
+    term_w = term_width + 0
+    if (term_w < 50) term_w = 80
+
+    bar_area = term_w - label_w - 1 - stats_w
+    if (bar_area < 10) bar_area = 10
+    if (bar_area > 60) bar_area = 60
+}
+
+function normalize_model(m) {
+    sub(/^anthropic\./, "", m)
+    sub(/-v[0-9]+:[0-9]+$/, "", m)
+    sub(/@.*$/, "", m)
+    return m
+}
+
+function get_cost(model, inp, out, cc, cr,    norm, p, rates) {
+    norm = normalize_model(model)
+    p = ""
+    for (pfx in pricing) {
+        if (index(norm, pfx) == 1) { p = pricing[pfx]; break }
+    }
+    if (p == "") p = "0.000003|0.000015|0.00000375|0.0000003"
+    split(p, rates, "|")
+    return (inp * rates[1]) + (out * rates[2]) + (cc * rates[3]) + (cr * rates[4])
+}
+
+function fmt_num(n) {
+    if (n >= 1000000000) return sprintf("%.1fB", n / 1000000000)
+    if (n >= 1000000)    return sprintf("%.1fM", n / 1000000)
+    if (n >= 1000)       return sprintf("%.1fk", n / 1000)
+    return sprintf("%d", n)
+}
+
+function fmt_cost(c) {
+    if (c >= 1000) return sprintf("$%.0f", c)
+    if (c >= 100)  return sprintf("$%.1f", c)
+    return          sprintf("$%.2f", c)
+}
+
+function nice_scale(raw,    mag, scaled) {
+    if (raw <= 0) return 1
+    mag    = 10 ^ int(log(raw) / log(10))
+    scaled = raw / mag
+    if (scaled <= 1) return mag
+    if (scaled <= 2) return 2 * mag
+    if (scaled <= 5) return 5 * mag
+    return 10 * mag
+}
+
+function render_bar(val, sc,    filled, bar, i) {
+    filled = int(val / sc)
+    if (filled > bar_area) filled = bar_area
+    if (filled < 0)        filled = 0
+    bar = ""
+    for (i = 1; i <= filled; i++)           bar = bar "█"
+    for (i = filled + 1; i <= bar_area; i++) bar = bar "░"
+    return bar
+}
+
+{
+    period = $1
+    req_id = $2
+    msg_id = $3
+    model  = $4
+    inp    = $5 + 0
+    out    = $6 + 0
+    cc     = $7 + 0
+    cr     = $8 + 0
+
+    # Date filtering (daily mode)
+    if (since != "" && period < since) next
+    if (until != "" && period > until) next
+
+    # Deduplication by msg_id:req_id
+    if (msg_id != "" && req_id != "") {
+        key = msg_id ":" req_id
+        if (key in seen) next
+        seen[key] = 1
+    }
+
+    # Aggregate by period
+    p_input[period]  += inp
+    p_output[period] += out
+    p_cc[period]     += cc
+    p_cr[period]     += cr
+    periods[period]   = 1
+
+    # Cost per model for accuracy
+    c = get_cost(model, inp, out, cc, cr)
+    p_cost[period] += c
+    total_cost     += c
+    total_input    += inp
+    total_output   += out
+    total_cc       += cc
+    total_cr       += cr
+}
+
+END {
+    n = asorti(periods, sorted)
+
+    # Hourly mode: gap-fill hours 00-23
+    if (hourly_mode == "true") {
+        for (h = 0; h <= 23; h++) {
+            hr = sprintf("%02d", h)
+            if (!(hr in periods)) {
+                p_input[hr] = 0; p_output[hr] = 0
+                p_cc[hr]    = 0; p_cr[hr]     = 0
+                p_cost[hr]  = 0; periods[hr]  = 1
+            }
+        }
+        n = asorti(periods, sorted)
+    }
+
+    # Apply --days limit (daily mode)
+    start_idx = 1
+    if (hourly_mode != "true" && days_limit > 0 && n > days_limit) {
+        start_idx = n - days_limit + 1
+    }
+
+    # Find max in+cache value for scale
+    max_val = 0
+    for (i = start_idx; i <= n; i++) {
+        p   = sorted[i]
+        inc = p_input[p] + p_cc[p] + p_cr[p]
+        if (inc > max_val) max_val = inc
+        if (split_mode == "true" && p_output[p] > max_val) max_val = p_output[p]
+    }
+
+    sc = nice_scale(max_val / bar_area)
+    if (sc <= 0) sc = 1
+
+    # Header
+    if (hourly_mode == "true") {
+        hdr = "Hourly breakdown · " day_filter
+    } else if (days_limit == 0) {
+        hdr = "Daily token usage · all time"
+    } else {
+        hdr = "Daily token usage · last " days_limit " days"
+    }
+    printf "%s%s · scale: █ = %s tokens%s\n\n", C_HDR, hdr, fmt_num(sc), C_RESET
+
+    # Data rows
+    for (i = start_idx; i <= n; i++) {
+        p    = sorted[i]
+        inc  = p_input[p] + p_cc[p] + p_cr[p]
+        out  = p_output[p]
+        cost = p_cost[p]
+
+        if (split_mode == "true") {
+            bar1 = render_bar(inc, sc)
+            bar2 = render_bar(out, sc)
+            printf "%s%-*s%s %s%s%s  %6s in+cache\n", \
+                C_LABEL, label_w, p, C_RESET, C_BAR_IN, bar1, C_RESET, fmt_num(inc)
+            printf "%*s %s%s%s  %6s output  %s%s%s\n", \
+                label_w, "", C_BAR_OUT, bar2, C_RESET, fmt_num(out), C_COST, fmt_cost(cost), C_RESET
+        } else {
+            bar = render_bar(inc, sc)
+            printf "%s%-*s%s %s%s%s  %s%6s in+c %6s out%s  %s%7s%s\n", \
+                C_LABEL, label_w, p, C_RESET, \
+                C_BAR_IN, bar, C_RESET, \
+                C_DIM, fmt_num(inc), fmt_num(out), C_RESET, \
+                C_COST, fmt_cost(cost), C_RESET
+        }
+    }
+
+    # Separator
+    sep = ""
+    sep_len = label_w + 1 + bar_area + stats_w
+    for (i = 1; i <= sep_len; i++) sep = sep "─"
+    printf "%s\n", sep
+
+    # Total row
+    t_inc  = total_input + total_cc + total_cr
+    t_out  = total_output
+    t_cost = fmt_cost(total_cost)
+
+    if (split_mode == "true") {
+        printf "%-*s  %s%6s in+cache%s\n", \
+            label_w + 1 + bar_area, "TOTAL", C_DIM, fmt_num(t_inc), C_RESET
+        printf "%-*s  %s%6s output%s  %s%7s%s\n", \
+            label_w + 1 + bar_area, "", C_DIM, fmt_num(t_out), C_RESET, C_COST, t_cost, C_RESET
+    } else {
+        printf "%-*s  %s%6s in+c %6s out%s  %s%7s%s\n", \
+            label_w + 1 + bar_area, "TOTAL", \
+            C_DIM, fmt_num(t_inc), fmt_num(t_out), C_RESET, \
+            C_COST, t_cost, C_RESET
+    }
+}
+AWKEOF
+
+# ============================================================================
+# Main
+# ============================================================================
+
+main() {
+    local log_dirs
+    log_dirs=$(get_log_dirs)
+
+    if [[ -z "$log_dirs" ]]; then
+        echo "No Claude log directories found." >&2
+        echo "Checked: ${DEFAULT_DIRS[*]}" >&2
+        exit 1
+    fi
+
+    local jsonl_files
+    jsonl_files=$(find $log_dirs -name "*.jsonl" -type f 2>/dev/null || true)
+
+    if [[ -z "$jsonl_files" ]]; then
+        echo "No JSONL files found in Claude directories." >&2
+        exit 1
+    fi
+
+    # Determine color mode (NO_COLOR env var is the standard convention)
+    local colors_off="false"
+    if [[ "$OPT_NO_COLOR" == "true" ]] || [[ -n "${NO_COLOR:-}" ]] || ! [[ -t 1 ]]; then
+        colors_off="true"
+    fi
+
+    # Terminal width
+    local term_w
+    term_w="${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}"
+
+    # Build jq filter and set mode flags
+    local jq_filter hourly="false"
+    if [[ -n "$DAY_FILTER" ]]; then
+        hourly="true"
+        jq_filter=$(build_hourly_filter "$DAY_FILTER")
+    else
+        jq_filter=$(build_daily_filter)
+    fi
+
+    # Run pipeline
+    echo "$jsonl_files" | while read -r file; do
+        jq -r "$jq_filter" "$file" 2>/dev/null || true
+    done | awk \
+        -v since="$SINCE_DATE" \
+        -v until="$UNTIL_DATE" \
+        -v days_limit="$DAYS_LIMIT" \
+        -v split_mode="$SPLIT_MODE" \
+        -v colors_off="$colors_off" \
+        -v hourly_mode="$hourly" \
+        -v day_filter="$DAY_FILTER" \
+        -v term_width="$term_w" \
+        "$AWK_SCRIPT"
+}
+
+main "$@"

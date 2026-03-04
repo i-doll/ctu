@@ -332,8 +332,10 @@ function fmt_num(n) {
     total_cache_create += cache_create
     total_cache_read += cache_read
     
-    # Accumulate actual cost per model for accurate total
-    total_cost_actual += get_cost(model, input, output, cache_create, cache_read)
+    # Accumulate actual cost per model for accurate totals
+    c = get_cost(model, input, output, cache_create, cache_read)
+    day_cost_actual[day] += c
+    total_cost_actual += c
 }
 
 END {
@@ -353,8 +355,8 @@ END {
             cc = day_cache_create[day]
             cr = day_cache_read[day]
             total = inp + out + cc + cr
-            cost = get_cost("claude-sonnet-4-5", inp, out, cc, cr)
-            
+            cost = day_cost_actual[day]
+
             printf "    {\"date\": \"%s\", \"input\": %d, \"output\": %d, \"cache_read\": %d, \"cache_create\": %d, \"total\": %d, \"cost_usd\": %.4f}", day, inp, out, cr, cc, total, cost
             if (i < n) printf ","
             printf "\n"
@@ -401,8 +403,8 @@ END {
                 cc = day_cache_create[day]
                 cr = day_cache_read[day]
                 total = inp + out + cc + cr
-                cost = get_cost("claude-sonnet-4-5", inp, out, cc, cr)
-                
+                cost = day_cost_actual[day]
+
                 printf "%-12s %8s %8s %8s %8s %8s %9.2f\n", day, fmt_num(inp), fmt_num(out), fmt_num(cr), fmt_num(cc), fmt_num(total), cost
             }
             

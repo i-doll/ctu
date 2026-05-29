@@ -23,17 +23,22 @@ DEFAULT_DIRS=(
 # ============================================================================
 
 declare -a PRICING_TABLE=(
-    # Sonnet 4.5 variants
-    "claude-sonnet-4-5|0.000003|0.000015|0.00000375|0.0000003"
-    # Opus 4.5 variants
+    # Opus — $5/$25 per MTok (Opus 4.5 through 4.8)
+    "claude-opus-4-8|0.000005|0.000025|0.00000625|0.0000005"
+    "claude-opus-4-7|0.000005|0.000025|0.00000625|0.0000005"
+    "claude-opus-4-6|0.000005|0.000025|0.00000625|0.0000005"
     "claude-opus-4-5|0.000005|0.000025|0.00000625|0.0000005"
-    # Opus 4.1 / Opus 4-20250514
+    # Opus — $15/$75 per MTok (Opus 4.1 and Opus 4)
     "claude-opus-4-1|0.000015|0.000075|0.00001875|0.0000015"
     "claude-opus-4-20250514|0.000015|0.000075|0.00001875|0.0000015"
-    # Haiku 4.5 variants
-    "claude-haiku-4-5|0.000001|0.000005|0.00000125|0.0000001"
-    # Sonnet 4-20250514 (same as sonnet-4-5)
+    # Sonnet — $3/$15 per MTok (Sonnet 4, 4.5, 4.6)
+    "claude-sonnet-4-6|0.000003|0.000015|0.00000375|0.0000003"
+    "claude-sonnet-4-5|0.000003|0.000015|0.00000375|0.0000003"
     "claude-sonnet-4-20250514|0.000003|0.000015|0.00000375|0.0000003"
+    # Haiku 4.5 — $1/$5 per MTok
+    "claude-haiku-4-5|0.000001|0.000005|0.00000125|0.0000001"
+    # Haiku 3.5 — $0.80/$4 per MTok (retired on first-party API)
+    "claude-3-5-haiku|0.0000008|0.000004|0.000001|0.00000008"
 )
 
 # ============================================================================
@@ -203,9 +208,9 @@ get_pricing() {
             return 0
         fi
     done
-    
-    # Default to sonnet pricing if unknown
-    echo "0.000003|0.000015|0.00000375|0.0000003"
+
+    # Unknown models contribute $0 (obvious in reports rather than mis-billed)
+    echo "0|0|0|0"
 }
 
 # ============================================================================
@@ -236,12 +241,17 @@ BEGIN {
     OFS = "\t"
     
     # Pricing table (model_prefix -> input|output|cache_create|cache_read)
-    pricing["claude-sonnet-4-5"] = "0.000003|0.000015|0.00000375|0.0000003"
-    pricing["claude-opus-4-5"] = "0.000005|0.000025|0.00000625|0.0000005"
-    pricing["claude-opus-4-1"] = "0.000015|0.000075|0.00001875|0.0000015"
-    pricing["claude-opus-4-20250514"] = "0.000015|0.000075|0.00001875|0.0000015"
-    pricing["claude-haiku-4-5"] = "0.000001|0.000005|0.00000125|0.0000001"
+    pricing["claude-opus-4-8"]          = "0.000005|0.000025|0.00000625|0.0000005"
+    pricing["claude-opus-4-7"]          = "0.000005|0.000025|0.00000625|0.0000005"
+    pricing["claude-opus-4-6"]          = "0.000005|0.000025|0.00000625|0.0000005"
+    pricing["claude-opus-4-5"]          = "0.000005|0.000025|0.00000625|0.0000005"
+    pricing["claude-opus-4-1"]          = "0.000015|0.000075|0.00001875|0.0000015"
+    pricing["claude-opus-4-20250514"]   = "0.000015|0.000075|0.00001875|0.0000015"
+    pricing["claude-sonnet-4-6"]        = "0.000003|0.000015|0.00000375|0.0000003"
+    pricing["claude-sonnet-4-5"]        = "0.000003|0.000015|0.00000375|0.0000003"
     pricing["claude-sonnet-4-20250514"] = "0.000003|0.000015|0.00000375|0.0000003"
+    pricing["claude-haiku-4-5"]         = "0.000001|0.000005|0.00000125|0.0000001"
+    pricing["claude-3-5-haiku"]         = "0.0000008|0.000004|0.000001|0.00000008"
 }
 
 function normalize_model(m) {
@@ -266,9 +276,9 @@ function get_cost(model, input, output, cache_create, cache_read) {
         }
     }
     
-    # Default to sonnet pricing
-    if (p == "") p = "0.000003|0.000015|0.00000375|0.0000003"
-    
+    # Unknown models contribute $0
+    if (p == "") p = "0|0|0|0"
+
     split(p, rates, "|")
     cost = (input * rates[1]) + (output * rates[2]) + (cache_create * rates[3]) + (cache_read * rates[4])
     return cost

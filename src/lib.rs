@@ -56,14 +56,28 @@ struct JsonUsage {
 
 // ── Pricing table ────────────────────────────────────────────────────────────
 
-// (prefix, input, output, cache_create, cache_read) per token
+// (prefix, input, output, cache_create, cache_read) per token.
+// Prices are USD per million tokens / 1_000_000; cache_create is the 5-minute
+// cache-write rate. Verified against the official Anthropic API pricing docs.
+// Longest/most-specific prefixes are not required to precede shorter ones here
+// because no prefix below is itself a prefix of another model's id.
 static PRICING: &[(&str, f64, f64, f64, f64)] = &[
-    ("claude-sonnet-4-5",        0.000003,  0.000015,  0.00000375, 0.0000003),
+    // Opus — $5 / $25 per MTok (Opus 4.5 through 4.8)
+    ("claude-opus-4-8",          0.000005,  0.000025,  0.00000625, 0.0000005),
+    ("claude-opus-4-7",          0.000005,  0.000025,  0.00000625, 0.0000005),
+    ("claude-opus-4-6",          0.000005,  0.000025,  0.00000625, 0.0000005),
     ("claude-opus-4-5",          0.000005,  0.000025,  0.00000625, 0.0000005),
+    // Opus — $15 / $75 per MTok (Opus 4.1 and Opus 4)
     ("claude-opus-4-1",          0.000015,  0.000075,  0.00001875, 0.0000015),
     ("claude-opus-4-20250514",   0.000015,  0.000075,  0.00001875, 0.0000015),
-    ("claude-haiku-4-5",         0.000001,  0.000005,  0.00000125, 0.0000001),
+    // Sonnet — $3 / $15 per MTok (Sonnet 4, 4.5, 4.6)
+    ("claude-sonnet-4-6",        0.000003,  0.000015,  0.00000375, 0.0000003),
+    ("claude-sonnet-4-5",        0.000003,  0.000015,  0.00000375, 0.0000003),
     ("claude-sonnet-4-20250514", 0.000003,  0.000015,  0.00000375, 0.0000003),
+    // Haiku 4.5 — $1 / $5 per MTok
+    ("claude-haiku-4-5",         0.000001,  0.000005,  0.00000125, 0.0000001),
+    // Haiku 3.5 — $0.80 / $4 per MTok (retired on the first-party API)
+    ("claude-3-5-haiku",         0.0000008, 0.000004,  0.000001,   0.00000008),
 ];
 
 // ── Public functions ─────────────────────────────────────────────────────────
@@ -83,12 +97,14 @@ pub fn normalize_model(m: &str) -> String {
 
 pub fn get_cost(model: &str, inp: u64, out: u64, cc: u64, cr: u64) -> f64 {
     let norm = normalize_model(model);
-    let (_, ip, op, cp, rp) = PRICING
-        .iter()
-        .find(|(pfx, ..)| norm.starts_with(pfx))
-        .copied()
-        .unwrap_or(("", 0.000003, 0.000015, 0.00000375, 0.0000003));
-    inp as f64 * ip + out as f64 * op + cc as f64 * cp + cr as f64 * rp
+    // Unknown / unpriced models (e.g. "<synthetic>") contribute $0 so they
+    // are obvious in reports rather than silently billed at some default rate.
+    match PRICING.iter().find(|(pfx, ..)| norm.starts_with(pfx)) {
+        Some(&(_, ip, op, cp, rp)) => {
+            inp as f64 * ip + out as f64 * op + cc as f64 * cp + cr as f64 * rp
+        }
+        None => 0.0,
+    }
 }
 
 pub fn fmt_num(n: u64) -> String {

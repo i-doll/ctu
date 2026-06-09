@@ -62,6 +62,8 @@ struct JsonUsage {
 // Longest/most-specific prefixes are not required to precede shorter ones here
 // because no prefix below is itself a prefix of another model's id.
 static PRICING: &[(&str, f64, f64, f64, f64)] = &[
+    // Fable 5 — $10 / $50 per MTok
+    ("claude-fable-5",           0.00001,   0.00005,   0.0000125,  0.000001),
     // Opus — $5 / $25 per MTok (Opus 4.5 through 4.8)
     ("claude-opus-4-8",          0.000005,  0.000025,  0.00000625, 0.0000005),
     ("claude-opus-4-7",          0.000005,  0.000025,  0.00000625, 0.0000005),

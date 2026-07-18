@@ -3,12 +3,19 @@ use std::io::Write;
 
 use clap::Parser;
 use is_terminal::IsTerminal;
-use terminal_size::{Width, terminal_size};
+use terminal_size::{terminal_size, Width};
 
-use ctu::{DeduplicatedRecords, PeriodAgg, fmt_cost, fmt_num, get_cost, get_log_dirs, find_jsonl_files};
+use ctu::{
+    find_jsonl_files, fmt_cost, fmt_num, get_log_dirs, get_opencode_files, get_record_cost,
+    DeduplicatedRecords, PeriodAgg,
+};
 
 #[derive(Parser)]
-#[command(name = "ctu-graph", version = "1.0.0", about = "Claude token usage bar chart")]
+#[command(
+    name = "ctu-graph",
+    version,
+    about = "Claude, Codex, and OpenCode token usage bar chart"
+)]
 struct Cli {
     /// Hourly drill-down for YYYY-MM-DD
     #[arg(short = 'd', long = "day")]
@@ -40,45 +47,62 @@ struct Cli {
 struct Colors {
     reset: &'static str,
     label: &'static str,
-    bar_in:  &'static str,
+    bar_in: &'static str,
     bar_out: &'static str,
-    dim:  &'static str,
+    dim: &'static str,
     cost: &'static str,
-    hdr:  &'static str,
+    hdr: &'static str,
 }
 
 const COLORS_ON: Colors = Colors {
-    reset:   "\x1b[0m",
-    label:   "\x1b[1;37m",
-    bar_in:  "\x1b[34m",
+    reset: "\x1b[0m",
+    label: "\x1b[1;37m",
+    bar_in: "\x1b[34m",
     bar_out: "\x1b[32m",
-    dim:     "\x1b[2;37m",
-    cost:    "\x1b[33m",
-    hdr:     "\x1b[1;36m",
+    dim: "\x1b[2;37m",
+    cost: "\x1b[33m",
+    hdr: "\x1b[1;36m",
 };
 
 const COLORS_OFF: Colors = Colors {
-    reset: "", label: "", bar_in: "", bar_out: "", dim: "", cost: "", hdr: "",
+    reset: "",
+    label: "",
+    bar_in: "",
+    bar_out: "",
+    dim: "",
+    cost: "",
+    hdr: "",
 };
 
 // ── Scale helpers ─────────────────────────────────────────────────────────────
 
 fn nice_scale(raw: f64) -> u64 {
-    if raw <= 0.0 { return 1; }
+    if raw <= 0.0 {
+        return 1;
+    }
     let mag = 10f64.powf(raw.log10().floor());
     let scaled = raw / mag;
-    let factor = if scaled <= 1.0 { 1.0 }
-                 else if scaled <= 2.0 { 2.0 }
-                 else if scaled <= 5.0 { 5.0 }
-                 else { 10.0 };
+    let factor = if scaled <= 1.0 {
+        1.0
+    } else if scaled <= 2.0 {
+        2.0
+    } else if scaled <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
     (factor * mag).ceil() as u64
 }
 
 fn render_bar(val: u64, scale: u64, bar_area: usize) -> String {
     let filled = ((val as f64 / scale as f64) as usize).min(bar_area);
     let mut bar = String::with_capacity(bar_area * 3);
-    for _ in 0..filled       { bar.push('█'); }
-    for _ in filled..bar_area { bar.push('░'); }
+    for _ in 0..filled {
+        bar.push('█');
+    }
+    for _ in filled..bar_area {
+        bar.push('░');
+    }
     bar
 }
 
@@ -88,13 +112,14 @@ fn main() {
     let cli = Cli::parse();
 
     let dirs = get_log_dirs();
-    if dirs.is_empty() {
-        eprintln!("No Claude log directories found.");
+    let opencode_files = get_opencode_files();
+    if dirs.is_empty() && opencode_files.is_empty() {
+        eprintln!("No Claude, Codex, or OpenCode usage data found.");
         std::process::exit(1);
     }
     let files = find_jsonl_files(&dirs);
-    if files.is_empty() {
-        eprintln!("No JSONL files found.");
+    if files.is_empty() && opencode_files.is_empty() {
+        eprintln!("No usage records found.");
         std::process::exit(1);
     }
 
@@ -105,36 +130,47 @@ fn main() {
     let mut periods: BTreeMap<String, PeriodAgg> = BTreeMap::new();
     let mut grand = PeriodAgg::default();
 
-    let data = DeduplicatedRecords::collect(&files);
+    let data = DeduplicatedRecords::collect_with_opencode(&files, &opencode_files);
     for rec in &data.records {
         let ts = &rec.timestamp;
-        if ts.len() < 13 { continue; }
-
-        let period: &str;
-        if hourly_mode {
-            if !ts.starts_with(&day_str) { continue; }
-            period = &ts[11..13];
-        } else {
-            let date = &ts[..10];
-            if let Some(ref s) = cli.since { if date < s.as_str() { continue; } }
-            if let Some(ref u) = cli.until { if date > u.as_str() { continue; } }
-            period = &ts[..10];
+        if ts.len() < 13 {
+            continue;
         }
 
-        let cost = get_cost(&rec.model, rec.input, rec.output, rec.cache_create, rec.cache_read);
+        let period = if hourly_mode {
+            if !ts.starts_with(&day_str) {
+                continue;
+            }
+            &ts[11..13]
+        } else {
+            let date = &ts[..10];
+            if let Some(ref s) = cli.since {
+                if date < s.as_str() {
+                    continue;
+                }
+            }
+            if let Some(ref u) = cli.until {
+                if date > u.as_str() {
+                    continue;
+                }
+            }
+            &ts[..10]
+        };
+
+        let cost = get_record_cost(rec);
 
         let agg = periods.entry(period.to_string()).or_default();
-        agg.input        += rec.input;
-        agg.output       += rec.output;
+        agg.input += rec.input;
+        agg.output += rec.output;
         agg.cache_create += rec.cache_create;
-        agg.cache_read   += rec.cache_read;
-        agg.cost         += cost;
+        agg.cache_read += rec.cache_read;
+        agg.cost += cost;
 
-        grand.input        += rec.input;
-        grand.output       += rec.output;
+        grand.input += rec.input;
+        grand.output += rec.output;
         grand.cache_create += rec.cache_create;
-        grand.cache_read   += rec.cache_read;
-        grand.cost         += cost;
+        grand.cache_read += rec.cache_read;
+        grand.cost += cost;
     }
 
     // Gap-fill hours 00-23
@@ -148,7 +184,9 @@ fn main() {
     let all_keys: Vec<String> = periods.keys().cloned().collect();
     let start = if !hourly_mode && cli.days > 0 && all_keys.len() > cli.days {
         all_keys.len() - cli.days
-    } else { 0 };
+    } else {
+        0
+    };
     let visible: Vec<&String> = all_keys[start..].iter().collect();
 
     // Layout
@@ -165,16 +203,26 @@ fn main() {
 
     // Color detection
     let use_color = !cli.no_color
-        && std::env::var("NO_COLOR").map(|v| v.is_empty()).unwrap_or(true)
+        && std::env::var("NO_COLOR")
+            .map(|v| v.is_empty())
+            .unwrap_or(true)
         && std::io::stdout().is_terminal();
     let c = if use_color { &COLORS_ON } else { &COLORS_OFF };
 
     // Scale: max of inc (and out in split mode)
-    let max_val = visible.iter().map(|p| {
-        let agg = &periods[*p];
-        let inc = agg.input + agg.cache_create + agg.cache_read;
-        if cli.split { inc.max(agg.output) } else { inc }
-    }).max().unwrap_or(0);
+    let max_val = visible
+        .iter()
+        .map(|p| {
+            let agg = &periods[*p];
+            let inc = agg.input + agg.cache_create + agg.cache_read;
+            if cli.split {
+                inc.max(agg.output)
+            } else {
+                inc
+            }
+        })
+        .max()
+        .unwrap_or(0);
 
     let scale = nice_scale(max_val as f64 / bar_area as f64).max(1);
 
@@ -189,36 +237,73 @@ fn main() {
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    writeln!(out, "{}{} · scale: █ = {} tokens{}\n",
-        c.hdr, hdr_txt, fmt_num(scale), c.reset).unwrap();
+    writeln!(
+        out,
+        "{}{} · scale: █ = {} tokens{}\n",
+        c.hdr,
+        hdr_txt,
+        fmt_num(scale),
+        c.reset
+    )
+    .unwrap();
 
     // Data rows
     for p in &visible {
         let agg = &periods[*p];
-        let inc  = agg.input + agg.cache_create + agg.cache_read;
+        let inc = agg.input + agg.cache_create + agg.cache_read;
         let cost = agg.cost;
 
         if cli.split {
             let bar1 = render_bar(inc, scale, bar_area);
             let bar2 = render_bar(agg.output, scale, bar_area);
-            writeln!(out, "{}{:<label_w$}{}  {}{}{} {:>6} in+cache",
-                c.label, p, c.reset,
-                c.bar_in, bar1, c.reset,
+            writeln!(
+                out,
+                "{}{:<label_w$}{}  {}{}{} {:>6} in+cache",
+                c.label,
+                p,
+                c.reset,
+                c.bar_in,
+                bar1,
+                c.reset,
                 fmt_num(inc),
-                label_w = label_w).unwrap();
-            writeln!(out, "{:<label_w$}  {}{}{} {:>6} output  {}{:>7}{}",
-                "", c.bar_out, bar2, c.reset,
+                label_w = label_w
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "{:<label_w$}  {}{}{} {:>6} output  {}{:>7}{}",
+                "",
+                c.bar_out,
+                bar2,
+                c.reset,
                 fmt_num(agg.output),
-                c.cost, fmt_cost(cost), c.reset,
-                label_w = label_w + 1).unwrap();
+                c.cost,
+                fmt_cost(cost),
+                c.reset,
+                label_w = label_w + 1
+            )
+            .unwrap();
         } else {
             let bar = render_bar(inc, scale, bar_area);
-            writeln!(out, "{}{:<label_w$}{}  {}{}{} {}{:>6} in+c {:>6} out{}  {}{:>7}{}",
-                c.label, p, c.reset,
-                c.bar_in, bar, c.reset,
-                c.dim, fmt_num(inc), fmt_num(agg.output), c.reset,
-                c.cost, fmt_cost(cost), c.reset,
-                label_w = label_w).unwrap();
+            writeln!(
+                out,
+                "{}{:<label_w$}{}  {}{}{} {}{:>6} in+c {:>6} out{}  {}{:>7}{}",
+                c.label,
+                p,
+                c.reset,
+                c.bar_in,
+                bar,
+                c.reset,
+                c.dim,
+                fmt_num(inc),
+                fmt_num(agg.output),
+                c.reset,
+                c.cost,
+                fmt_cost(cost),
+                c.reset,
+                label_w = label_w
+            )
+            .unwrap();
         }
     }
 
@@ -229,18 +314,43 @@ fn main() {
     // Total row
     let t_inc = grand.input + grand.cache_create + grand.cache_read;
     if cli.split {
-        writeln!(out, "{:<w$}  {}{:>6} in+cache{}",
-            "TOTAL", c.dim, fmt_num(t_inc), c.reset,
-            w = label_w + 1 + bar_area).unwrap();
-        writeln!(out, "{:<w$}  {}{:>6} output{}  {}{:>7}{}",
-            "", c.dim, fmt_num(grand.output), c.reset,
-            c.cost, fmt_cost(grand.cost), c.reset,
-            w = label_w + 1 + bar_area).unwrap();
-    } else {
-        writeln!(out, "{:<w$}  {}{:>6} in+c {:>6} out{}  {}{:>7}{}",
+        writeln!(
+            out,
+            "{:<w$}  {}{:>6} in+cache{}",
             "TOTAL",
-            c.dim, fmt_num(t_inc), fmt_num(grand.output), c.reset,
-            c.cost, fmt_cost(grand.cost), c.reset,
-            w = label_w + 1 + bar_area).unwrap();
+            c.dim,
+            fmt_num(t_inc),
+            c.reset,
+            w = label_w + 1 + bar_area
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "{:<w$}  {}{:>6} output{}  {}{:>7}{}",
+            "",
+            c.dim,
+            fmt_num(grand.output),
+            c.reset,
+            c.cost,
+            fmt_cost(grand.cost),
+            c.reset,
+            w = label_w + 1 + bar_area
+        )
+        .unwrap();
+    } else {
+        writeln!(
+            out,
+            "{:<w$}  {}{:>6} in+c {:>6} out{}  {}{:>7}{}",
+            "TOTAL",
+            c.dim,
+            fmt_num(t_inc),
+            fmt_num(grand.output),
+            c.reset,
+            c.cost,
+            fmt_cost(grand.cost),
+            c.reset,
+            w = label_w + 1 + bar_area
+        )
+        .unwrap();
     }
 }

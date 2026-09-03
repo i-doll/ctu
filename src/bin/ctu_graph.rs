@@ -14,7 +14,7 @@ use ctu::{
 #[command(
     name = "ctu-graph",
     version,
-    about = "Claude, Codex, and OpenCode token usage bar chart"
+    about = "Claude, Codex, OpenCode, and Pi token usage bar chart"
 )]
 struct Cli {
     /// Hourly drill-down for YYYY-MM-DD
@@ -114,7 +114,7 @@ fn main() {
     let dirs = get_log_dirs();
     let opencode_files = get_opencode_files();
     if dirs.is_empty() && opencode_files.is_empty() {
-        eprintln!("No Claude, Codex, or OpenCode usage data found.");
+        eprintln!("No Claude, Codex, OpenCode, or Pi usage data found.");
         std::process::exit(1);
     }
     let files = find_jsonl_files(&dirs);

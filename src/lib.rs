@@ -37,25 +37,41 @@ struct JsonLine {
     #[serde(rename = "type")]
     kind: String,
     timestamp: String,
+    id: Option<String>,
     #[serde(rename = "requestId", default)]
     request_id: Option<String>,
     message: Option<JsonMessage>,
     payload: Option<CodexPayload>,
+    usage: Option<JsonUsage>,
 }
 
 #[derive(Deserialize)]
 struct JsonMessage {
     id: Option<String>,
+    role: Option<String>,
+    provider: Option<String>,
     model: Option<String>,
+    #[serde(rename = "responseModel")]
+    response_model: Option<String>,
     usage: Option<JsonUsage>,
 }
 
 #[derive(Deserialize)]
 struct JsonUsage {
+    #[serde(alias = "input")]
     input_tokens: Option<u64>,
+    #[serde(alias = "output")]
     output_tokens: Option<u64>,
+    #[serde(alias = "cacheWrite")]
     cache_creation_input_tokens: Option<u64>,
+    #[serde(alias = "cacheRead")]
     cache_read_input_tokens: Option<u64>,
+    cost: Option<JsonCost>,
+}
+
+#[derive(Deserialize)]
+struct JsonCost {
+    total: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -483,6 +499,33 @@ pub fn get_log_dirs() -> Vec<PathBuf> {
         dirs.push(home.join(".codex/sessions"));
     }
 
+    let pi_session_dir = std::env::var("PI_CODING_AGENT_SESSION_DIR")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let pi_config_dir = std::env::var("PI_CODING_AGENT_DIR")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let home = dirs_home();
+    if let Some(dir) = resolve_pi_log_dir(
+        pi_session_dir.as_deref(),
+        pi_config_dir.as_deref(),
+        home.as_deref(),
+    ) {
+        dirs.push(dir);
+    }
+
+    if let Some(session_file) = std::env::var("PI_SESSION_FILE")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        if let Some(parent) = session_file.parent() {
+            if !dirs.iter().any(|dir| parent.starts_with(dir)) {
+                dirs.push(parent.to_path_buf());
+            }
+        }
+    }
+
     let mut seen = HashSet::new();
     dirs.into_iter()
         .filter(|d| d.is_dir() && seen.insert(d.clone()))
@@ -542,6 +585,32 @@ fn dirs_home() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
 }
 
+fn resolve_pi_log_dir(
+    session_dir: Option<&str>,
+    config_dir: Option<&str>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(session_dir) = session_dir {
+        return Some(expand_tilde(session_dir, home));
+    }
+    if let Some(config_dir) = config_dir {
+        return Some(expand_tilde(config_dir, home).join("sessions"));
+    }
+    home.map(|home| home.join(".pi/agent/sessions"))
+}
+
+fn expand_tilde(path: &str, home: Option<&Path>) -> PathBuf {
+    if path == "~" {
+        return home
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(path));
+    }
+    if let (Some(rest), Some(home)) = (path.strip_prefix("~/"), home) {
+        return home.join(rest);
+    }
+    PathBuf::from(path)
+}
+
 pub fn find_jsonl_files(dirs: &[PathBuf]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for dir in dirs {
@@ -592,12 +661,16 @@ pub fn iter_file_records(path: &PathBuf) -> impl Iterator<Item = RawRecord> {
 fn parse_lines(lines: Vec<String>, source_id: &str) -> Vec<RawRecord> {
     let mut codex_model = "unknown".to_string();
     let mut codex_provider = "openai".to_string();
+    let mut pi_session = false;
     let mut records = Vec::new();
 
     for (line_no, line) in lines.into_iter().enumerate() {
         let Ok(jl) = serde_json::from_str::<JsonLine>(&line) else {
             continue;
         };
+        if line_no == 0 {
+            pi_session = jl.kind == "session";
+        }
         if jl.kind == "assistant" {
             let Some(msg) = jl.message.as_ref() else {
                 continue;
@@ -620,47 +693,130 @@ fn parse_lines(lines: Vec<String>, source_id: &str) -> Vec<RawRecord> {
             continue;
         }
 
-        let Some(payload) = jl.payload.as_ref() else {
+        if !pi_session {
+            let Some(payload) = jl.payload.as_ref() else {
+                continue;
+            };
+            if jl.kind == "session_meta" {
+                if let Some(provider) = payload.model_provider.as_ref() {
+                    codex_provider.clone_from(provider);
+                }
+                continue;
+            }
+            if jl.kind == "turn_context" {
+                if let Some(model) = payload.model.as_ref() {
+                    codex_model.clone_from(model);
+                }
+                continue;
+            }
+            if jl.kind != "event_msg" || payload.kind.as_deref() != Some("token_count") {
+                continue;
+            }
+            let Some(usage) = payload
+                .info
+                .as_ref()
+                .and_then(|i| i.last_token_usage.as_ref())
+            else {
+                continue;
+            };
+            let cached = usage.cached_input_tokens.unwrap_or(0);
+            records.push(RawRecord {
+                timestamp: jl.timestamp.clone(),
+                req_id: source_id.to_string(),
+                msg_id: format!("{}:{}", jl.timestamp, line_no + 1),
+                provider: codex_provider.clone(),
+                model: codex_model.clone(),
+                cost_usd: None,
+                input: usage.input_tokens.unwrap_or(0).saturating_sub(cached),
+                output: usage.output_tokens.unwrap_or(0),
+                cache_create: 0,
+                cache_read: cached,
+            });
             continue;
-        };
-        if jl.kind == "session_meta" {
-            if let Some(provider) = payload.model_provider.as_ref() {
-                codex_provider.clone_from(provider);
+        }
+
+        if jl.kind == "message" {
+            let Some(msg) = jl.message.as_ref() else {
+                continue;
+            };
+            let Some(usage) = msg.usage.as_ref() else {
+                continue;
+            };
+            if !matches!(msg.role.as_deref(), Some("assistant" | "toolResult")) {
+                continue;
+            }
+            let (provider, model) = if msg.role.as_deref() == Some("assistant") {
+                let model = msg
+                    .response_model
+                    .clone()
+                    .or_else(|| msg.model.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let provider = msg
+                    .provider
+                    .clone()
+                    .unwrap_or_else(|| claude_provider(&model).to_string());
+                (provider, model)
+            } else {
+                ("pi".to_string(), "tools/summaries".to_string())
+            };
+            records.push(pi_usage_record(
+                &jl, usage, &provider, &model, line_no, source_id,
+            ));
+            continue;
+        }
+
+        if matches!(jl.kind.as_str(), "compaction" | "branch_summary") {
+            if let Some(usage) = jl.usage.as_ref() {
+                records.push(pi_usage_record(
+                    &jl,
+                    usage,
+                    "pi",
+                    "tools/summaries",
+                    line_no,
+                    source_id,
+                ));
             }
             continue;
         }
-        if jl.kind == "turn_context" {
-            if let Some(model) = payload.model.as_ref() {
-                codex_model.clone_from(model);
-            }
-            continue;
-        }
-        if jl.kind != "event_msg" || payload.kind.as_deref() != Some("token_count") {
-            continue;
-        }
-        let Some(usage) = payload
-            .info
-            .as_ref()
-            .and_then(|i| i.last_token_usage.as_ref())
-        else {
-            continue;
-        };
-        let cached = usage.cached_input_tokens.unwrap_or(0);
-        records.push(RawRecord {
-            timestamp: jl.timestamp.clone(),
-            req_id: source_id.to_string(),
-            msg_id: format!("{}:{}", jl.timestamp, line_no + 1),
-            provider: codex_provider.clone(),
-            model: codex_model.clone(),
-            cost_usd: None,
-            input: usage.input_tokens.unwrap_or(0).saturating_sub(cached),
-            output: usage.output_tokens.unwrap_or(0),
-            cache_create: 0,
-            cache_read: cached,
-        });
     }
 
     records
+}
+
+fn pi_usage_record(
+    line: &JsonLine,
+    usage: &JsonUsage,
+    provider: &str,
+    model: &str,
+    line_no: usize,
+    source_id: &str,
+) -> RawRecord {
+    let input = usage.input_tokens.unwrap_or(0);
+    let output = usage.output_tokens.unwrap_or(0);
+    let cache_create = usage.cache_creation_input_tokens.unwrap_or(0);
+    let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+    let msg_id = line
+        .id
+        .clone()
+        .unwrap_or_else(|| format!("{}:{}", line.timestamp, line_no + 1));
+    let req_id = if line.id.is_some() {
+        format!("pi:{}:{}", line.kind, line.timestamp)
+    } else {
+        source_id.to_string()
+    };
+
+    RawRecord {
+        timestamp: line.timestamp.clone(),
+        req_id,
+        msg_id,
+        provider: provider.to_string(),
+        model: model.to_string(),
+        cost_usd: usage.cost.as_ref().and_then(|cost| cost.total),
+        input,
+        output,
+        cache_create,
+        cache_read,
+    }
 }
 
 fn claude_provider(model: &str) -> &'static str {
@@ -900,6 +1056,27 @@ mod tests {
     }
 
     #[test]
+    fn resolves_pi_log_path_precedence_and_tildes() {
+        let home = Path::new("/home/test");
+        assert_eq!(
+            resolve_pi_log_dir(Some("~/custom"), Some("~/config"), Some(home)),
+            Some(home.join("custom"))
+        );
+        assert_eq!(
+            resolve_pi_log_dir(None, Some("~/config"), Some(home)),
+            Some(home.join("config/sessions"))
+        );
+        assert_eq!(
+            resolve_pi_log_dir(None, None, Some(home)),
+            Some(home.join(".pi/agent/sessions"))
+        );
+        assert_eq!(
+            resolve_pi_log_dir(Some("relative/sessions"), None, Some(home)),
+            Some(PathBuf::from("relative/sessions"))
+        );
+    }
+
+    #[test]
     fn prices_current_and_legacy_openai_models() {
         assert_close(get_cost("gpt-5.6-sol", 100_000, 100_000, 0, 0), 2.40);
         assert_close(get_cost("gpt-5.6-cyber", 100_000, 100_000, 0, 0), 8.75);
@@ -1110,6 +1287,83 @@ mod tests {
             (40, 7, 60)
         );
         assert_eq!(records[1].req_id, "codex-session.jsonl");
+    }
+
+    #[test]
+    fn parses_pi_usage_and_recorded_costs() {
+        let lines = vec![
+            r#"{"type":"session","version":3,"id":"session","timestamp":"2026-09-03T09:59:59.000Z","cwd":"/tmp"}"#.to_string(),
+            r#"{"type":"message","id":"assistant","parentId":null,"timestamp":"2026-09-03T10:00:01.000Z","message":{"role":"assistant","provider":"openrouter","model":"auto","responseModel":"gpt-5.6-sol","usage":{"input":100,"output":20,"cacheRead":60,"cacheWrite":5,"reasoning":7,"totalTokens":180,"cost":{"input":0.1,"output":0.2,"cacheRead":0.01,"cacheWrite":0.02,"total":0.33}},"stopReason":"stop","timestamp":1788429601000}}"#.to_string(),
+            r#"{"type":"message","id":"tool","parentId":"assistant","timestamp":"2026-09-03T10:00:02.000Z","message":{"role":"toolResult","toolName":"delegate","usage":{"input":10,"output":2,"cacheRead":3,"cacheWrite":4,"totalTokens":19,"cost":{"total":0.04}},"isError":false,"timestamp":1788429602000}}"#.to_string(),
+            r#"{"type":"compaction","id":"compaction","parentId":"tool","timestamp":"2026-09-03T10:00:03.000Z","summary":"summary","tokensBefore":1000,"usage":{"input":30,"output":6,"cacheRead":7,"cacheWrite":8,"totalTokens":51,"cost":{"total":0.05}}}"#.to_string(),
+            r#"{"type":"branch_summary","id":"branch","parentId":"compaction","timestamp":"2026-09-03T10:00:04.000Z","summary":"summary","fromId":"other","usage":{"input":40,"output":9,"cacheRead":10,"cacheWrite":11,"totalTokens":70,"cost":{"total":0}}}"#.to_string(),
+        ];
+
+        let records = parse_lines(lines, "pi-session.jsonl");
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0].provider, "openrouter");
+        assert_eq!(records[0].model, "gpt-5.6-sol");
+        assert_eq!(
+            (
+                records[0].input,
+                records[0].output,
+                records[0].cache_create,
+                records[0].cache_read
+            ),
+            (100, 20, 5, 60)
+        );
+        assert_close(records[0].cost_usd.unwrap(), 0.33);
+
+        for record in &records[1..] {
+            assert_eq!(record.provider, "pi");
+            assert_eq!(record.model, "tools/summaries");
+        }
+        assert_close(records[1].cost_usd.unwrap(), 0.04);
+        assert_close(records[2].cost_usd.unwrap(), 0.05);
+        assert_close(get_record_cost(&records[3]), 0.0);
+    }
+
+    #[test]
+    fn deduplicates_pi_entries_copied_between_sessions() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ctu-pi-{unique}"));
+        std::fs::create_dir(&dir).unwrap();
+        let first_path = dir.join("first.jsonl");
+        let fork_path = dir.join("fork.jsonl");
+        let shared = r#"{"type":"message","id":"same-entry","parentId":null,"timestamp":"2026-09-03T10:00:01.000Z","message":{"role":"assistant","provider":"anthropic","model":"claude-sonnet-5","usage":{"input":10,"output":2,"cacheRead":3,"cacheWrite":4,"cost":{"total":0.01}}}}"#;
+        let fork_only = r#"{"type":"message","id":"fork-entry","parentId":"same-entry","timestamp":"2026-09-03T10:00:02.000Z","message":{"role":"assistant","provider":"anthropic","model":"claude-sonnet-5","usage":{"input":20,"output":4,"cacheRead":6,"cacheWrite":8,"cost":{"total":0.02}}}}"#;
+        std::fs::write(
+            &first_path,
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"first\",\"timestamp\":\"2026-09-03T10:00:00.000Z\",\"cwd\":\"/tmp\"}}\n{shared}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &fork_path,
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"fork\",\"timestamp\":\"2026-09-03T10:00:00.000Z\",\"cwd\":\"/tmp\"}}\n{shared}\n{fork_only}\n"
+            ),
+        )
+        .unwrap();
+
+        let records = DeduplicatedRecords::collect(&[first_path, fork_path]).records;
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].msg_id, "same-entry");
+        assert_eq!(records[1].msg_id, "fork-entry");
+    }
+
+    #[test]
+    fn ignores_pi_shaped_messages_without_a_session_header() {
+        let records = parse_lines(
+            vec![r#"{"type":"message","id":"foreign","timestamp":"2026-09-03T10:00:00.000Z","message":{"role":"assistant","provider":"anthropic","model":"claude-sonnet-5","usage":{"input":10,"output":2,"cacheRead":3,"cacheWrite":4,"cost":{"total":0.01}}}}"#.to_string()],
+            "foreign.jsonl",
+        );
+        assert!(records.is_empty());
     }
 
     #[test]

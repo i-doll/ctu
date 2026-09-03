@@ -13,7 +13,7 @@ use ctu::{
 #[command(
     name = "ctu",
     version,
-    about = "Claude, Codex, and OpenCode token usage scanner"
+    about = "Claude, Codex, OpenCode, and Pi token usage scanner"
 )]
 struct Cli {
     /// Show daily breakdown (default)
@@ -63,7 +63,7 @@ fn main() {
     let dirs = get_log_dirs();
     let opencode_files = get_opencode_files();
     if dirs.is_empty() && opencode_files.is_empty() {
-        eprintln!("No Claude, Codex, or OpenCode usage data found.");
+        eprintln!("No Claude, Codex, OpenCode, or Pi usage data found.");
         std::process::exit(1);
     }
 

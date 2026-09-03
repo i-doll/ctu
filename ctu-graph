@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# ctu-graph — Claude Token Usage Bar Chart
-# Visualizes token usage as a horizontal terminal bar chart.
+# ctu-graph: Token Usage Bar Chart
+# Visualizes Claude and Pi token usage as a horizontal terminal bar chart.
 set -euo pipefail
 
 VERSION="1.0.0"
@@ -13,7 +13,13 @@ DEFAULT_DIRS=(
 
 # Pricing table (model_pattern|input|output|cache_create|cache_read per token)
 declare -a PRICING_TABLE=(
+    # Fable 5.1 — $10/$50 per MTok, cache reads 2.5% of input ($0.25/MTok)
+    "claude-fable-5-1|0.00001|0.00005|0.0000125|0.00000025"
     "claude-fable-5|0.00001|0.00005|0.0000125|0.000001"
+    # Opus 5 — $5/$25 per MTok
+    "claude-opus-5|0.000005|0.000025|0.00000625|0.0000005"
+    # Sonnet 5 — $2/$10 per MTok (the launch "introductory" rate became standard)
+    "claude-sonnet-5|0.000002|0.00001|0.0000025|0.0000002"
     "claude-opus-4-8|0.000005|0.000025|0.00000625|0.0000005"
     "claude-opus-4-7|0.000005|0.000025|0.00000625|0.0000005"
     "claude-opus-4-6|0.000005|0.000025|0.00000625|0.0000005"
@@ -25,6 +31,8 @@ declare -a PRICING_TABLE=(
     "claude-sonnet-4-20250514|0.000003|0.000015|0.00000375|0.0000003"
     "claude-haiku-4-5|0.000001|0.000005|0.00000125|0.0000001"
     "claude-3-5-haiku|0.0000008|0.000004|0.000001|0.00000008"
+    # Sonnet 3.7 — $3/$15 per MTok (retired on the first-party API)
+    "claude-3-7-sonnet|0.000003|0.000015|0.00000375|0.0000003"
 )
 
 # ============================================================================
@@ -42,7 +50,7 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") [OPTIONS]
 
-Visualize Claude token usage as a horizontal bar chart.
+Visualize Claude and Pi token usage as a horizontal bar chart.
 
 Options:
   -d, --day DATE      Hourly drill-down for YYYY-MM-DD
@@ -125,6 +133,14 @@ check_deps
 # Directory Discovery
 # ============================================================================
 
+expand_log_path() {
+    case "$1" in
+        "~") printf '%s\n' "$HOME" ;;
+        "~/"*) printf '%s/%s\n' "$HOME" "${1#\~/}" ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
 get_log_dirs() {
     local dirs=()
     if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
@@ -142,6 +158,19 @@ get_log_dirs() {
     else
         dirs=("${DEFAULT_DIRS[@]}")
     fi
+
+    if [[ -n "${PI_CODING_AGENT_SESSION_DIR:-}" ]]; then
+        dirs+=("$(expand_log_path "$PI_CODING_AGENT_SESSION_DIR")")
+    elif [[ -n "${PI_CODING_AGENT_DIR:-}" ]]; then
+        dirs+=("$(expand_log_path "$PI_CODING_AGENT_DIR")/sessions")
+    else
+        dirs+=("$HOME/.pi/agent/sessions")
+    fi
+
+    if [[ -n "${PI_SESSION_FILE:-}" ]]; then
+        dirs+=("$(dirname "$PI_SESSION_FILE")")
+    fi
+
     for dir in "${dirs[@]}"; do
         [[ -d "$dir" ]] && echo "$dir"
     done
@@ -151,41 +180,71 @@ get_log_dirs() {
 # JQ Filter Builders
 # ============================================================================
 
+read -r -d '' JQ_RECORD_FILTER <<'JQEOF' || true
+input as $first
+| ($first.type == "session") as $is_pi
+| ($first, inputs)
+| def pi_req($kind; $timestamp):
+  ["pi", $kind, $timestamp]
+  | map(tostring)
+  | join(":");
+
+def record($timestamp; $req_id; $msg_id; $model; $usage; $cost):
+  {
+    timestamp: $timestamp,
+    req_id: $req_id,
+    msg_id: $msg_id,
+    model: $model,
+    input: ($usage.input_tokens // $usage.input // 0),
+    output: ($usage.output_tokens // $usage.output // 0),
+    cache_create: ($usage.cache_creation_input_tokens // $usage.cacheWrite // 0),
+    cache_read: ($usage.cache_read_input_tokens // $usage.cacheRead // 0),
+    cost: $cost
+  };
+
+if .type == "assistant" and .message.usage != null then
+  record(.timestamp; (.requestId // ""); (.message.id // "");
+         (.message.model // "unknown"); .message.usage; null)
+elif $is_pi
+     and .type == "message"
+     and (.message.role == "assistant" or .message.role == "toolResult")
+     and .message.usage != null then
+  .message.usage as $usage
+  | (if .message.role == "assistant"
+     then (.message.responseModel // .message.model // "unknown")
+     else "tools/summaries"
+     end) as $model
+  | record(.timestamp; pi_req(.type; .timestamp); (.id // "");
+           $model; $usage; ($usage.cost.total // null))
+elif $is_pi
+     and (.type == "compaction" or .type == "branch_summary")
+     and .usage != null then
+  .usage as $usage
+  | record(.timestamp; pi_req(.type; .timestamp); (.id // "");
+           "tools/summaries"; $usage; ($usage.cost.total // null))
+else
+  empty
+end
+JQEOF
+
 build_daily_filter() {
+    printf '%s\n' "$JQ_RECORD_FILTER"
     cat <<'JQEOF'
-select(.type == "assistant" and .message.usage != null) |
-{
-  period: (.timestamp | split("T")[0]),
-  req_id: (.requestId // ""),
-  msg_id: (.message.id // ""),
-  model:  (.message.model // "unknown"),
-  input:  (.message.usage.input_tokens // 0),
-  output: (.message.usage.output_tokens // 0),
-  cache_create: (.message.usage.cache_creation_input_tokens // 0),
-  cache_read:   (.message.usage.cache_read_input_tokens // 0)
-} |
-[.period, .req_id, .msg_id, .model, .input, .output, .cache_create, .cache_read] |
-@tsv
+| [(.timestamp | split("T")[0]), .req_id, .msg_id, .model,
+   .input, .output, .cache_create, .cache_read, .cost]
+| @tsv
 JQEOF
 }
 
 build_hourly_filter() {
     local day="$1"
+    printf '%s\n' "$JQ_RECORD_FILTER"
     # Embed the date via shell interpolation; day is YYYY-MM-DD from CLI arg
     cat <<JQEOF
-select(.type == "assistant" and .message.usage != null and (.timestamp | startswith("${day}"))) |
-{
-  period: (.timestamp | split("T")[1] | split(":")[0]),
-  req_id: (.requestId // ""),
-  msg_id: (.message.id // ""),
-  model:  (.message.model // "unknown"),
-  input:  (.message.usage.input_tokens // 0),
-  output: (.message.usage.output_tokens // 0),
-  cache_create: (.message.usage.cache_creation_input_tokens // 0),
-  cache_read:   (.message.usage.cache_read_input_tokens // 0)
-} |
-[.period, .req_id, .msg_id, .model, .input, .output, .cache_create, .cache_read] |
-@tsv
+| select(.timestamp | startswith("${day}"))
+| [(.timestamp | split("T")[1] | split(":")[0]), .req_id, .msg_id, .model,
+   .input, .output, .cache_create, .cache_read, .cost]
+| @tsv
 JQEOF
 }
 
@@ -198,7 +257,10 @@ BEGIN {
     FS = "\t"
 
     # Pricing table
+    pricing["claude-fable-5-1"]         = "0.00001|0.00005|0.0000125|0.00000025"
     pricing["claude-fable-5"]           = "0.00001|0.00005|0.0000125|0.000001"
+    pricing["claude-opus-5"]            = "0.000005|0.000025|0.00000625|0.0000005"
+    pricing["claude-sonnet-5"]          = "0.000002|0.00001|0.0000025|0.0000002"
     pricing["claude-opus-4-8"]          = "0.000005|0.000025|0.00000625|0.0000005"
     pricing["claude-opus-4-7"]          = "0.000005|0.000025|0.00000625|0.0000005"
     pricing["claude-opus-4-6"]          = "0.000005|0.000025|0.00000625|0.0000005"
@@ -210,6 +272,16 @@ BEGIN {
     pricing["claude-sonnet-4-20250514"] = "0.000003|0.000015|0.00000375|0.0000003"
     pricing["claude-haiku-4-5"]         = "0.000001|0.000005|0.00000125|0.0000001"
     pricing["claude-3-5-haiku"]         = "0.0000008|0.000004|0.000001|0.00000008"
+    pricing["claude-3-7-sonnet"]        = "0.000003|0.000015|0.00000375|0.0000003"
+
+    # Dated price windows, checked before the flat table above. Ordered and
+    # 1-indexed because awk's `for (k in array)` iteration order is undefined,
+    # which cannot express "first matching window wins".
+    # Format: prefix|from|until|input|output|cache_create|cache_read
+    # `from` inclusive, `until` exclusive, either may be "" for unbounded.
+    dated_n = 0
+    # No Claude model currently has a dated window: Sonnet 5's planned
+    # 2026-09-01 increase to $3/$15 was cancelled and $2/$10 became standard.
 
     # ANSI colors
     if (colors_off == "true") {
@@ -247,11 +319,26 @@ function normalize_model(m) {
     return m
 }
 
-function get_cost(model, inp, out, cc, cr,    norm, p, rates) {
+function get_cost(model, date, inp, out, cc, cr,    norm, p, rates, i, w) {
     norm = normalize_model(model)
     p = ""
-    for (pfx in pricing) {
-        if (index(norm, pfx) == 1) { p = pricing[pfx]; break }
+
+    # Dated windows win over the flat table. Scanned in order; first match
+    # wins. A "" bound is unbounded on that side; `from` inclusive, `until`
+    # exclusive, so adjacent windows can share a boundary date.
+    for (i = 1; i <= dated_n; i++) {
+        split(dated[i], w, "|")
+        if (index(norm, w[1]) != 1)         continue
+        if (w[2] != "" && date <  w[2])     continue
+        if (w[3] != "" && date >= w[3])     continue
+        p = w[4] "|" w[5] "|" w[6] "|" w[7]
+        break
+    }
+
+    if (p == "") {
+        for (pfx in pricing) {
+            if (index(norm, pfx) == 1) { p = pricing[pfx]; break }
+        }
     }
     if (p == "") p = "0|0|0|0"
     split(p, rates, "|")
@@ -300,6 +387,7 @@ function render_bar(val, sc,    filled, bar, i) {
     out    = $6 + 0
     cc     = $7 + 0
     cr     = $8 + 0
+    recorded_cost = $9
 
     # Date filtering (daily mode)
     if (since != "" && period < since) next
@@ -319,8 +407,12 @@ function render_bar(val, sc,    filled, bar, i) {
     p_cr[period]     += cr
     periods[period]   = 1
 
-    # Cost per model for accuracy
-    c = get_cost(model, inp, out, cc, cr)
+    # Cost per model for accuracy. In daily mode `period` is the YYYY-MM-DD
+    # date; in hourly mode it is just the hour ("14"), so the date comes from
+    # the --day argument instead.
+    cost_date = (hourly_mode == "true") ? day_filter : period
+    if (recorded_cost != "") c = recorded_cost + 0
+    else c = get_cost(model, cost_date, inp, out, cc, cr)
     p_cost[period] += c
     total_cost     += c
     total_input    += inp
@@ -431,16 +523,15 @@ main() {
     log_dirs=$(get_log_dirs)
 
     if [[ -z "$log_dirs" ]]; then
-        echo "No Claude log directories found." >&2
-        echo "Checked: ${DEFAULT_DIRS[*]}" >&2
+        echo "No Claude or Pi log directories found." >&2
         exit 1
     fi
 
     local jsonl_files
-    jsonl_files=$(find $log_dirs -name "*.jsonl" -type f 2>/dev/null || true)
+    jsonl_files=$(find $log_dirs -name "*.jsonl" -type f 2>/dev/null | sort -u || true)
 
     if [[ -z "$jsonl_files" ]]; then
-        echo "No JSONL files found in Claude directories." >&2
+        echo "No JSONL files found in Claude or Pi directories." >&2
         exit 1
     fi
 
@@ -465,7 +556,7 @@ main() {
 
     # Run pipeline
     echo "$jsonl_files" | while read -r file; do
-        jq -r "$jq_filter" "$file" 2>/dev/null || true
+        jq -nr "$jq_filter" "$file" 2>/dev/null || true
     done | awk \
         -v since="$SINCE_DATE" \
         -v until="$UNTIL_DATE" \

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# <ID> Claude JSONL Token Usage Scanner
-# Scans Claude CLI log files and calculates token usage with cost estimates.
+# <ID> JSONL Token Usage Scanner
+# Scans Claude and Pi log files and calculates token usage with cost estimates.
 # Replicates the logic from CostUsageScanner+Claude.swift in bash.
 
 set -euo pipefail
@@ -24,7 +24,13 @@ DEFAULT_DIRS=(
 
 declare -a PRICING_TABLE=(
     # Fable 5 — $10/$50 per MTok
+    # Fable 5.1 — $10/$50 per MTok, cache reads 2.5% of input ($0.25/MTok)
+    "claude-fable-5-1|0.00001|0.00005|0.0000125|0.00000025"
     "claude-fable-5|0.00001|0.00005|0.0000125|0.000001"
+    # Opus 5 — $5/$25 per MTok
+    "claude-opus-5|0.000005|0.000025|0.00000625|0.0000005"
+    # Sonnet 5 — $2/$10 per MTok (the launch "introductory" rate became standard)
+    "claude-sonnet-5|0.000002|0.00001|0.0000025|0.0000002"
     # Opus — $5/$25 per MTok (Opus 4.5 through 4.8)
     "claude-opus-4-8|0.000005|0.000025|0.00000625|0.0000005"
     "claude-opus-4-7|0.000005|0.000025|0.00000625|0.0000005"
@@ -41,6 +47,8 @@ declare -a PRICING_TABLE=(
     "claude-haiku-4-5|0.000001|0.000005|0.00000125|0.0000001"
     # Haiku 3.5 — $0.80/$4 per MTok (retired on first-party API)
     "claude-3-5-haiku|0.0000008|0.000004|0.000001|0.00000008"
+    # Sonnet 3.7 — $3/$15 per MTok (retired on the first-party API)
+    "claude-3-7-sonnet|0.000003|0.000015|0.00000375|0.0000003"
 )
 
 # ============================================================================
@@ -58,7 +66,7 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") [OPTIONS]
 
-Scan Claude CLI JSONL log files and calculate token usage with cost estimates.
+Scan Claude and Pi JSONL log files and calculate token usage with cost estimates.
 
 Options:
   -d, --daily         Show daily breakdown (default)
@@ -78,7 +86,10 @@ Examples:
   $(basename "$0") -s 2025-02-01 -u 2025-02-05 -j  # Date range, JSON output
 
 Environment:
-  CLAUDE_CONFIG_DIR   Override default log directories (comma-separated)
+  CLAUDE_CONFIG_DIR             Override Claude log directories (comma-separated)
+  PI_CODING_AGENT_DIR           Override Pi's config directory
+  PI_CODING_AGENT_SESSION_DIR   Override Pi's session directory
+  PI_SESSION_FILE               Include the current Pi session's directory
 EOF
     exit 0
 }
@@ -148,6 +159,14 @@ check_deps
 # Directory Discovery
 # ============================================================================
 
+expand_log_path() {
+    case "$1" in
+        "~") printf '%s\n' "$HOME" ;;
+        "~/"*) printf '%s/%s\n' "$HOME" "${1#\~/}" ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
 get_log_dirs() {
     local dirs=()
     
@@ -167,6 +186,18 @@ get_log_dirs() {
         done
     else
         dirs=("${DEFAULT_DIRS[@]}")
+    fi
+
+    if [[ -n "${PI_CODING_AGENT_SESSION_DIR:-}" ]]; then
+        dirs+=("$(expand_log_path "$PI_CODING_AGENT_SESSION_DIR")")
+    elif [[ -n "${PI_CODING_AGENT_DIR:-}" ]]; then
+        dirs+=("$(expand_log_path "$PI_CODING_AGENT_DIR")/sessions")
+    else
+        dirs+=("$HOME/.pi/agent/sessions")
+    fi
+
+    if [[ -n "${PI_SESSION_FILE:-}" ]]; then
+        dirs+=("$(dirname "$PI_SESSION_FILE")")
     fi
     
     # Filter to existing directories
@@ -221,19 +252,53 @@ get_pricing() {
 
 # Build jq filter for extracting usage data
 JQ_FILTER='
-select(.type == "assistant" and .message.usage != null) |
-{
-  day: (.timestamp | split("T")[0]),
-  req_id: (.requestId // ""),
-  msg_id: (.message.id // ""),
-  model: (.message.model // "unknown"),
-  input: (.message.usage.input_tokens // 0),
-  output: (.message.usage.output_tokens // 0),
-  cache_create: (.message.usage.cache_creation_input_tokens // 0),
-  cache_read: (.message.usage.cache_read_input_tokens // 0)
-} |
-[.day, .req_id, .msg_id, .model, .input, .output, .cache_create, .cache_read] |
-@tsv
+input as $first
+| ($first.type == "session") as $is_pi
+| ($first, inputs)
+| def pi_req($kind; $timestamp):
+  ["pi", $kind, $timestamp]
+  | map(tostring)
+  | join(":");
+
+def record($timestamp; $req_id; $msg_id; $model; $usage; $cost):
+  {
+    day: ($timestamp | split("T")[0]),
+    req_id: $req_id,
+    msg_id: $msg_id,
+    model: $model,
+    input: ($usage.input_tokens // $usage.input // 0),
+    output: ($usage.output_tokens // $usage.output // 0),
+    cache_create: ($usage.cache_creation_input_tokens // $usage.cacheWrite // 0),
+    cache_read: ($usage.cache_read_input_tokens // $usage.cacheRead // 0),
+    cost: $cost
+  };
+
+if .type == "assistant" and .message.usage != null then
+  record(.timestamp; (.requestId // ""); (.message.id // "");
+         (.message.model // "unknown"); .message.usage; null)
+elif $is_pi
+     and .type == "message"
+     and (.message.role == "assistant" or .message.role == "toolResult")
+     and .message.usage != null then
+  .message.usage as $usage
+  | (if .message.role == "assistant"
+     then (.message.responseModel // .message.model // "unknown")
+     else "tools/summaries"
+     end) as $model
+  | record(.timestamp; pi_req(.type; .timestamp); (.id // "");
+           $model; $usage; ($usage.cost.total // null))
+elif $is_pi
+     and (.type == "compaction" or .type == "branch_summary")
+     and .usage != null then
+  .usage as $usage
+  | record(.timestamp; pi_req(.type; .timestamp); (.id // "");
+           "tools/summaries"; $usage; ($usage.cost.total // null))
+else
+  empty
+end
+| [.day, .req_id, .msg_id, .model, .input, .output,
+   .cache_create, .cache_read, .cost]
+| @tsv
 '
 
 # AWK script for deduplication, aggregation, and cost calculation
@@ -243,7 +308,10 @@ BEGIN {
     OFS = "\t"
     
     # Pricing table (model_prefix -> input|output|cache_create|cache_read)
+    pricing["claude-fable-5-1"]         = "0.00001|0.00005|0.0000125|0.00000025"
     pricing["claude-fable-5"]           = "0.00001|0.00005|0.0000125|0.000001"
+    pricing["claude-opus-5"]            = "0.000005|0.000025|0.00000625|0.0000005"
+    pricing["claude-sonnet-5"]          = "0.000002|0.00001|0.0000025|0.0000002"
     pricing["claude-opus-4-8"]          = "0.000005|0.000025|0.00000625|0.0000005"
     pricing["claude-opus-4-7"]          = "0.000005|0.000025|0.00000625|0.0000005"
     pricing["claude-opus-4-6"]          = "0.000005|0.000025|0.00000625|0.0000005"
@@ -255,6 +323,16 @@ BEGIN {
     pricing["claude-sonnet-4-20250514"] = "0.000003|0.000015|0.00000375|0.0000003"
     pricing["claude-haiku-4-5"]         = "0.000001|0.000005|0.00000125|0.0000001"
     pricing["claude-3-5-haiku"]         = "0.0000008|0.000004|0.000001|0.00000008"
+    pricing["claude-3-7-sonnet"]        = "0.000003|0.000015|0.00000375|0.0000003"
+
+    # Dated price windows, checked before the flat table above. Ordered and
+    # 1-indexed because awk's `for (k in array)` iteration order is undefined,
+    # which cannot express "first matching window wins".
+    # Format: prefix|from|until|input|output|cache_create|cache_read
+    # `from` inclusive, `until` exclusive, either may be "" for unbounded.
+    dated_n = 0
+    # No Claude model currently has a dated window: Sonnet 5's planned
+    # 2026-09-01 increase to $3/$15 was cancelled and $2/$10 became standard.
 }
 
 function normalize_model(m) {
@@ -267,15 +345,30 @@ function normalize_model(m) {
     return m
 }
 
-function get_cost(model, input, output, cache_create, cache_read) {
+function get_cost(model, date, input, output, cache_create, cache_read,    i, w) {
     norm = normalize_model(model)
-    
-    # Find matching pricing
+
     p = ""
-    for (prefix in pricing) {
-        if (index(norm, prefix) == 1) {
-            p = pricing[prefix]
-            break
+
+    # Dated windows win over the flat table. Scanned in order; first match
+    # wins. A "" bound is unbounded on that side; `from` inclusive, `until`
+    # exclusive, so adjacent windows can share a boundary date.
+    for (i = 1; i <= dated_n; i++) {
+        split(dated[i], w, "|")
+        if (index(norm, w[1]) != 1)         continue
+        if (w[2] != "" && date <  w[2])     continue
+        if (w[3] != "" && date >= w[3])     continue
+        p = w[4] "|" w[5] "|" w[6] "|" w[7]
+        break
+    }
+
+    # Find matching pricing
+    if (p == "") {
+        for (prefix in pricing) {
+            if (index(norm, prefix) == 1) {
+                p = pricing[prefix]
+                break
+            }
         }
     }
     
@@ -305,6 +398,7 @@ function fmt_num(n) {
     output = $6 + 0
     cache_create = $7 + 0
     cache_read = $8 + 0
+    recorded_cost = $9
     
     # Date filtering
     if (since != "" && day < since) next
@@ -345,8 +439,11 @@ function fmt_num(n) {
     total_cache_create += cache_create
     total_cache_read += cache_read
     
-    # Accumulate actual cost per model for accurate totals
-    c = get_cost(model, input, output, cache_create, cache_read)
+    # Pi records include the provider's calculated cost. Claude records use
+    # the local pricing table.
+    if (recorded_cost != "") c = recorded_cost + 0
+    else c = get_cost(model, day, input, output, cache_create, cache_read)
+    dm_cost_actual[dm] += c
     day_cost_actual[day] += c
     total_cost_actual += c
 }
@@ -389,7 +486,7 @@ END {
                 out = dm_output[dm]
                 cc = dm_cache_create[dm]
                 cr = dm_cache_read[dm]
-                cost = get_cost(model, inp, out, cc, cr)
+                cost = dm_cost_actual[dm]
                 
                 printf "    {\"date\": \"%s\", \"model\": \"%s\", \"input\": %d, \"output\": %d, \"cache_read\": %d, \"cache_create\": %d, \"cost_usd\": %.4f}", day, model, inp, out, cr, cc, cost
                 if (i < m) printf ","
@@ -440,7 +537,7 @@ END {
                 out = dm_output[dm]
                 cc = dm_cache_create[dm]
                 cr = dm_cache_read[dm]
-                cost = get_cost(model, inp, out, cc, cr)
+                cost = dm_cost_actual[dm]
                 
                 # Truncate model name if too long
                 if (length(model) > 26) model = substr(model, 1, 23) "..."
@@ -480,17 +577,16 @@ main() {
     log_dirs=$(get_log_dirs)
     
     if [[ -z "$log_dirs" ]]; then
-        echo "No Claude log directories found." >&2
-        echo "Checked: ${DEFAULT_DIRS[*]}" >&2
+        echo "No Claude or Pi log directories found." >&2
         exit 1
     fi
     
     # Find all JSONL files
     local jsonl_files
-    jsonl_files=$(find $log_dirs -name "*.jsonl" -type f 2>/dev/null || true)
+    jsonl_files=$(find $log_dirs -name "*.jsonl" -type f 2>/dev/null | sort -u || true)
     
     if [[ -z "$jsonl_files" ]]; then
-        echo "No JSONL files found in Claude directories." >&2
+        echo "No JSONL files found in Claude or Pi directories." >&2
         exit 1
     fi
     
@@ -502,7 +598,7 @@ main() {
     # Process all files through jq, then aggregate with awk
     echo "$jsonl_files" | while read -r file; do
         # Use jq with --raw-output to handle each line, ignore parse errors
-        jq -r "$JQ_FILTER" "$file" 2>/dev/null || true
+        jq -nr "$JQ_FILTER" "$file" 2>/dev/null || true
     done | awk \
         -v since="$SINCE_DATE" \
         -v until="$UNTIL_DATE" \

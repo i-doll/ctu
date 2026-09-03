@@ -129,8 +129,8 @@ struct OpenCodeTime {
 // lexically against the record's date, `from` inclusive and `until` exclusive,
 // so adjacent windows share a boundary date without overlapping:
 //
-//     price!("claude-sonnet-5", 2.00, 10.00, 2.50, 0.20).until("2026-09-01"),
-//     price!("claude-sonnet-5", 3.00, 15.00, 3.75, 0.30).from("2026-09-01"),
+//     price!("gpt-5.6-sol", 5.00, 30.00, 6.25, 0.50, long).until("2026-08-21"),
+//     price!("gpt-5.6-sol", 4.00, 20.00, 5.00, 0.40, long).from("2026-08-21"),
 //
 // Order windows oldest-first and keep them adjacent, since lookup takes the
 // first entry whose prefix and date both match. An undated entry matches every
@@ -211,12 +211,22 @@ macro_rules! price {
 }
 
 static PRICING: &[ModelPricing] = &[
-    // OpenAI GPT-5.6 — cache writes are 1.25x uncached input.
-    price!("gpt-5.6-terra", 2.50, 15.00, 3.125, 0.25, long),
-    price!("gpt-5.6-luna", 1.00, 6.00, 1.25, 0.10, long),
-    price!("gpt-5.6-sol", 5.00, 30.00, 6.25, 0.50, long),
-    price!("gpt-5.6", 5.00, 30.00, 6.25, 0.50, long),
+    // OpenAI GPT-5.6 — cache writes are 1.25x uncached input. Terra and Luna
+    // were cut on 2026-07-30 and Sol on 2026-08-21; the Sol rate is billed as
+    // promotional "at least through 2026-11-21" with no later price announced,
+    // so its window stays open-ended.
+    price!("gpt-5.6-terra", 2.50, 15.00, 3.125, 0.25, long).until("2026-07-30"),
+    price!("gpt-5.6-terra", 2.00, 12.00, 2.50, 0.20, long).from("2026-07-30"),
+    price!("gpt-5.6-luna", 1.00, 6.00, 1.25, 0.10, long).until("2026-07-30"),
+    price!("gpt-5.6-luna", 0.20, 1.20, 0.25, 0.02, long).from("2026-07-30"),
+    price!("gpt-5.6-sol", 5.00, 30.00, 6.25, 0.50, long).until("2026-08-21"),
+    price!("gpt-5.6-sol", 4.00, 20.00, 5.00, 0.40, long).from("2026-08-21"),
+    // Cyber variants have no long-context tier.
+    price!("gpt-5.6-cyber", 12.50, 75.00, 15.625, 1.25),
+    // There is no plain "gpt-5.6"; an unrecognised 5.6 variant bills at Sol.
+    price!("gpt-5.6", 4.00, 20.00, 5.00, 0.40, long),
     // Current general models available in Codex.
+    price!("gpt-5.5-cyber", 12.50, 75.00, 15.625, 1.25),
     price!("gpt-5.5-pro", 30.00, 180.00, 30.00, 30.00, long),
     price!("gpt-5.5", 5.00, 30.00, 5.00, 0.50, long),
     price!("gpt-5.4-mini", 0.75, 4.50, 0.75, 0.075),
@@ -251,7 +261,14 @@ static PRICING: &[ModelPricing] = &[
     // Google Gemini — cache reads are 10% of input; the per-hour storage fee on
     // explicit caches is not billed per token, so it is out of scope here.
     // Only Pro carries a long-context surcharge (>200K), Flash bills flat.
-    price!("gemini-3.6-flash", 1.50, 7.50, 1.50, 0.15),
+    // Flash 3.6 through 3.8 are $0.75 / $3.75 through 2026-12-31 and
+    // $1.50 / $7.50 from 2027-01-01.
+    price!("gemini-3.8-flash", 0.75, 3.75, 0.75, 0.075).until("2027-01-01"),
+    price!("gemini-3.8-flash", 1.50, 7.50, 1.50, 0.15).from("2027-01-01"),
+    price!("gemini-3.7-flash", 0.75, 3.75, 0.75, 0.075).until("2027-01-01"),
+    price!("gemini-3.7-flash", 1.50, 7.50, 1.50, 0.15).from("2027-01-01"),
+    price!("gemini-3.6-flash", 0.75, 3.75, 0.75, 0.075).until("2027-01-01"),
+    price!("gemini-3.6-flash", 1.50, 7.50, 1.50, 0.15).from("2027-01-01"),
     price!("gemini-3.5-flash-lite", 0.30, 2.50, 0.30, 0.03),
     price!("gemini-3.5-flash", 1.50, 9.00, 1.50, 0.15),
     price!("gemini-3.1-flash-lite", 0.25, 1.50, 0.25, 0.025),
@@ -260,7 +277,8 @@ static PRICING: &[ModelPricing] = &[
     // The proxy's "gemini-pro-agent" alias tracks the current Pro tier.
     price!("gemini-pro", 2.00, 12.00, 2.00, 0.20, long 200_000, 1.5),
     // xAI Grok — every rate doubles above 200K input tokens.
-    price!("grok-4.5", 2.00, 6.00, 2.00, 0.50, long 200_000, 2.0),
+    price!("grok-4.6", 2.00, 6.00, 2.00, 0.50, long 200_000, 2.0),
+    price!("grok-4.5", 2.00, 6.00, 2.00, 0.30, long 200_000, 2.0),
     price!("grok-4.3", 1.25, 2.50, 1.25, 0.20, long 200_000, 2.0),
     price!("grok-4.20", 1.25, 2.50, 1.25, 0.20, long 200_000, 2.0),
     price!("grok-build", 1.00, 2.00, 1.00, 0.20, long 200_000, 2.0),
@@ -268,20 +286,25 @@ static PRICING: &[ModelPricing] = &[
     price!("grok-3-mini", 0.30, 0.50, 0.30, 0.075),
     // Moonshot Kimi — cache hits are ~10% of input; no long-context surcharge.
     price!("kimi-k3", 3.00, 15.00, 3.00, 0.30),
+    price!("kimi-k2.7-code-highspeed", 1.90, 8.00, 1.90, 0.38),
     price!("kimi-k2.7-code", 0.95, 4.00, 0.95, 0.19),
-    price!("kimi-k2.6", 0.95, 4.00, 0.95, 0.19),
+    price!("kimi-k2.6", 0.95, 4.00, 0.95, 0.16),
     price!("kimi-k2.5", 0.60, 3.00, 0.60, 0.19),
     price!("kimi-k2-thinking", 0.60, 2.50, 0.60, 0.15),
     price!("kimi-k2", 0.55, 2.20, 0.55, 0.15),
-    // Fable 5 — $10 / $50 per MTok
+    // Fable 5.1 / Mythos 5.1 — $10 / $50 per MTok; cache reads are 2.5% of
+    // input ($0.25) rather than the usual 10%. Must precede the Fable 5 prefix.
+    price!("claude-fable-5-1", 10.00, 50.00, 12.50, 0.25),
+    price!("claude-mythos-5-1", 10.00, 50.00, 12.50, 0.25),
+    // Fable 5 / Mythos 5 — $10 / $50 per MTok
     price!("claude-fable-5", 10.00, 50.00, 12.50, 1.00),
+    price!("claude-mythos-5", 10.00, 50.00, 12.50, 1.00),
     // Opus 5 — $5 / $25 per MTok
     price!("claude-opus-5", 5.00, 25.00, 6.25, 0.50),
-    // Sonnet 5 — introductory $2 / $10 per MTok through 2026-08-31, then the
-    // $3 / $15 list price from 2026-09-01. Cache rates scale with input
-    // (write 1.25x, read 0.1x), so they shift with it.
-    price!("claude-sonnet-5", 2.00, 10.00, 2.50, 0.20).until("2026-09-01"),
-    price!("claude-sonnet-5", 3.00, 15.00, 3.75, 0.30).from("2026-09-01"),
+    // Sonnet 5 — $2 / $10 per MTok. Launched as an introductory rate through
+    // 2026-08-31; Anthropic later made it the standard price and cancelled
+    // the planned $3 / $15 step, so there is no dated window.
+    price!("claude-sonnet-5", 2.00, 10.00, 2.50, 0.20),
     // Opus — $5 / $25 per MTok (Opus 4.5 through 4.8)
     price!("claude-opus-4-8", 5.00, 25.00, 6.25, 0.50),
     price!("claude-opus-4-7", 5.00, 25.00, 6.25, 0.50),
@@ -306,7 +329,7 @@ static PRICING: &[ModelPricing] = &[
     // than as $0. Keep last: these prefixes are short and would otherwise
     // shadow the specific ids above.
     price!("gemini-default", 1.50, 9.00, 1.50, 0.15),
-    price!("fable", 10.00, 50.00, 12.50, 1.00),
+    price!("fable", 10.00, 50.00, 12.50, 0.25),
     price!("opus", 5.00, 25.00, 6.25, 0.50),
     price!("sonnet", 3.00, 15.00, 3.75, 0.30),
     price!("haiku", 1.00, 5.00, 1.25, 0.10),
@@ -878,7 +901,8 @@ mod tests {
 
     #[test]
     fn prices_current_and_legacy_openai_models() {
-        assert_close(get_cost("gpt-5.6-sol", 100_000, 100_000, 0, 0), 3.5);
+        assert_close(get_cost("gpt-5.6-sol", 100_000, 100_000, 0, 0), 2.40);
+        assert_close(get_cost("gpt-5.6-cyber", 100_000, 100_000, 0, 0), 8.75);
         assert_close(get_cost("gpt-5.3-codex", 1_000_000, 1_000_000, 0, 0), 15.75);
         assert_close(get_cost("gpt-5", 1_000_000, 1_000_000, 0, 0), 11.25);
         assert_close(get_cost("gpt-4o", 1_000_000, 1_000_000, 0, 0), 12.50);
@@ -886,9 +910,11 @@ mod tests {
 
     #[test]
     fn prices_cached_input_and_long_context() {
-        assert_close(get_cost("gpt-5.6", 0, 0, 1_000_000, 1_000_000), 13.50);
+        assert_close(get_cost("gpt-5.6", 0, 0, 1_000_000, 1_000_000), 10.80);
         // More than 272K total input applies 2x input/cache and 1.5x output.
-        assert_close(get_cost("gpt-5.6-terra", 272_001, 10_000, 0, 0), 1.585005);
+        assert_close(get_cost("gpt-5.6-terra", 272_001, 10_000, 0, 0), 1.268004);
+        // Cyber has no long-context tier.
+        assert_close(get_cost("gpt-5.6-cyber", 272_001, 10_000, 0, 0), 4.1500125);
     }
 
     #[test]
@@ -901,10 +927,19 @@ mod tests {
         // Kept under each provider's long-context threshold to test base rates;
         // the surcharges have their own test below.
         assert_close(get_cost("gemini-3.1-pro", 100_000, 100_000, 0, 0), 1.40);
+        assert_close(get_cost("grok-4.6", 100_000, 100_000, 0, 0), 0.80);
         assert_close(get_cost("grok-4.5", 100_000, 100_000, 0, 0), 0.80);
+        // Grok 4.5 cache reads are 15% of input, unlike 4.6's 25%.
+        assert_close(get_cost("grok-4.5", 0, 0, 0, 100_000), 0.03);
+        assert_close(get_cost("grok-4.6", 0, 0, 0, 100_000), 0.05);
         assert_close(get_cost("grok-4.5-build-free", 100_000, 0, 0, 0), 0.20);
         assert_close(get_cost("kimi-k3", 1_000_000, 1_000_000, 0, 0), 18.00);
         assert_close(get_cost("kimi-k2.6", 1_000_000, 1_000_000, 0, 0), 4.95);
+        assert_close(get_cost("kimi-k2.6", 0, 0, 0, 1_000_000), 0.16);
+        assert_close(
+            get_cost("kimi-k2.7-code-highspeed", 1_000_000, 1_000_000, 0, 0),
+            9.90,
+        );
     }
 
     #[test]
@@ -913,6 +948,7 @@ mod tests {
         assert_close(get_cost("sonnet", 1_000_000, 0, 0, 0), 3.00);
         assert_close(get_cost("haiku", 1_000_000, 0, 0, 0), 1.00);
         assert_close(get_cost("fable", 1_000_000, 0, 0, 0), 10.00);
+        assert_close(get_cost("fable", 0, 0, 0, 1_000_000), 0.25);
         assert_close(get_cost("gemini-default", 1_000_000, 0, 0, 0), 1.50);
         // The aliases must not shadow fully-qualified ids that share a prefix.
         assert_close(get_cost("claude-opus-4-1", 1_000_000, 0, 0, 0), 15.00);
@@ -921,44 +957,64 @@ mod tests {
 
     #[test]
     fn prices_dated_windows_by_record_date() {
-        // Sonnet 5 introductory rate: $2 / $10 per MTok through 2026-08-31.
+        // GPT-5.6 Sol: $5 / $30 per MTok until the 2026-08-21 cut to $4 / $20.
+        // Token counts stay under 272K so the long-context surcharge stays out.
         assert_close(
-            get_cost_on("claude-sonnet-5", "2026-07-25", 1_000_000, 1_000_000, 0, 0),
-            12.00,
+            get_cost_on("gpt-5.6-sol", "2026-07-25", 100_000, 100_000, 0, 0),
+            3.50,
         );
-        // Last day of the intro window still bills at the intro rate.
+        // Last day of the old window still bills at the old rate.
         assert_close(
-            get_cost_on("claude-sonnet-5", "2026-08-31", 1_000_000, 0, 0, 0),
-            2.00,
+            get_cost_on("gpt-5.6-sol", "2026-08-20", 100_000, 0, 0, 0),
+            0.50,
         );
-        // `until` is exclusive, so the boundary date itself is list price.
+        // `until` is exclusive, so the boundary date itself is the new price.
         assert_close(
-            get_cost_on("claude-sonnet-5", "2026-09-01", 1_000_000, 1_000_000, 0, 0),
-            18.00,
+            get_cost_on("gpt-5.6-sol", "2026-08-21", 100_000, 100_000, 0, 0),
+            2.40,
         );
         assert_close(
-            get_cost_on("claude-sonnet-5", "2027-03-14", 1_000_000, 0, 0, 0),
-            3.00,
+            get_cost_on("gpt-5.6-sol", "2027-03-14", 100_000, 0, 0, 0),
+            0.40,
         );
         // Cache rates shift with the window too.
         assert_close(
-            get_cost_on("claude-sonnet-5", "2026-07-25", 0, 0, 1_000_000, 1_000_000),
-            2.70,
+            get_cost_on("gpt-5.6-sol", "2026-08-20", 0, 0, 100_000, 100_000),
+            0.675,
         );
         assert_close(
-            get_cost_on("claude-sonnet-5", "2026-09-01", 0, 0, 1_000_000, 1_000_000),
-            4.05,
+            get_cost_on("gpt-5.6-sol", "2026-08-21", 0, 0, 100_000, 100_000),
+            0.54,
         );
-        // A dateless call bills at the latest window, not the intro rate.
-        assert_close(get_cost("claude-sonnet-5", 1_000_000, 0, 0, 0), 3.00);
+        // The long-context surcharge applies within whichever window matches.
+        assert_close(
+            get_cost_on("gpt-5.6-sol", "2026-08-20", 272_001, 0, 0, 0),
+            2.72001,
+        );
+        // A window can also start in the future: Gemini 3.6 Flash doubles on
+        // 2027-01-01, and a dateless call bills at that latest window.
+        assert_close(
+            get_cost_on("gemini-3.6-flash", "2026-12-31", 1_000_000, 0, 0, 0),
+            0.75,
+        );
+        assert_close(
+            get_cost_on("gemini-3.6-flash", "2027-01-01", 1_000_000, 0, 0, 0),
+            1.50,
+        );
+        assert_close(get_cost("gpt-5.6-sol", 100_000, 0, 0, 0), 0.40);
+        assert_close(get_cost("gemini-3.6-flash", 1_000_000, 0, 0, 0), 1.50);
     }
 
     #[test]
     fn undated_models_ignore_the_record_date() {
         for date in ["2024-01-01", "2026-07-25", "2099-12-31"] {
             assert_close(get_cost_on("claude-opus-5", date, 1_000_000, 0, 0, 0), 5.00);
+            assert_close(
+                get_cost_on("claude-sonnet-5", date, 1_000_000, 0, 0, 0),
+                2.00,
+            );
             // Kept under 272K so the long-context surcharge stays out of it.
-            assert_close(get_cost_on("gpt-5.6-sol", date, 100_000, 0, 0, 0), 0.50);
+            assert_close(get_cost_on("gpt-5.5", date, 100_000, 0, 0, 0), 0.50);
             assert_close(get_cost_on("kimi-k3", date, 1_000_000, 0, 0, 0), 3.00);
         }
     }
@@ -969,21 +1025,22 @@ mod tests {
             timestamp: timestamp.to_string(),
             req_id: "req".into(),
             msg_id: "msg".into(),
-            provider: "anthropic".into(),
-            model: "claude-sonnet-5".into(),
+            provider: "openai".into(),
+            model: "gpt-5.6-sol".into(),
             cost_usd: None,
-            input: 1_000_000,
+            // Under 272K so the long-context surcharge stays out of it.
+            input: 100_000,
             output: 0,
             cache_create: 0,
             cache_read: 0,
         };
 
-        // A record from the intro window keeps billing at the intro rate even
-        // after the list price takes effect.
-        assert_close(get_record_cost(&dated("2026-07-25T10:00:00Z")), 2.00);
-        assert_close(get_record_cost(&dated("2026-09-01T10:00:00Z")), 3.00);
+        // A record from before the price cut keeps billing at the old rate
+        // even after the new price takes effect.
+        assert_close(get_record_cost(&dated("2026-07-25T10:00:00Z")), 0.50);
+        assert_close(get_record_cost(&dated("2026-08-21T10:00:00Z")), 0.40);
         // A malformed timestamp falls back to the latest rates rather than $0.
-        assert_close(get_record_cost(&dated("bogus")), 3.00);
+        assert_close(get_record_cost(&dated("bogus")), 0.40);
 
         // A recorded cost still wins over the table, dated windows included.
         let mut recorded = dated("2026-07-25T10:00:00Z");
@@ -996,8 +1053,17 @@ mod tests {
         assert_close(get_cost("claude-opus-5", 1_000_000, 1_000_000, 0, 0), 30.00);
         assert_close(
             get_cost("claude-sonnet-5", 1_000_000, 1_000_000, 0, 0),
-            18.00,
+            12.00,
         );
+        assert_close(
+            get_cost("claude-fable-5-1", 1_000_000, 1_000_000, 0, 0),
+            60.00,
+        );
+        // Fable/Mythos 5.1 cache reads are 2.5% of input; Fable 5 stays at 10%.
+        assert_close(get_cost("claude-fable-5-1", 0, 0, 0, 1_000_000), 0.25);
+        assert_close(get_cost("claude-mythos-5-1", 0, 0, 0, 1_000_000), 0.25);
+        assert_close(get_cost("claude-fable-5", 0, 0, 0, 1_000_000), 1.00);
+        assert_close(get_cost("claude-mythos-5", 0, 0, 0, 1_000_000), 1.00);
         assert_close(
             get_cost("claude-3-7-sonnet-20250219", 1_000_000, 0, 0, 0),
             3.00,
@@ -1013,6 +1079,7 @@ mod tests {
         assert_close(get_cost("grok-4.5", 200_001, 100_000, 0, 0), 2.000004);
         // Gemini Flash bills flat at any size.
         assert_close(get_cost("gemini-3.5-flash", 1_000_000, 0, 0, 0), 1.50);
+        assert_close(get_cost("gemini-3.8-flash", 1_000_000, 0, 0, 0), 1.50);
     }
 
     #[test]

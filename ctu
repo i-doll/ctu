@@ -57,7 +57,9 @@ declare -a PRICING_TABLE=(
 
 SHOW_DAILY=true
 SHOW_MODEL=false
+SHOW_HARNESS=false
 SHOW_TOTAL=false
+HARNESS_FILTER=""
 SINCE_DATE=""
 UNTIL_DATE=""
 JSON_OUTPUT=false
@@ -71,6 +73,8 @@ Scan Claude and Pi JSONL log files and calculate token usage with cost estimates
 Options:
   -d, --daily         Show daily breakdown (default)
   -m, --by-model      Include per-model breakdown
+      --by-harness    Include per-harness breakdown
+      --harness NAME  Include only one harness (claude or pi)
   -t, --total         Show only total summary
   -s, --since DATE    Filter from date (YYYY-MM-DD)
   -u, --until DATE    Filter until date (YYYY-MM-DD)
@@ -104,6 +108,14 @@ while [[ $# -gt 0 ]]; do
         -m|--by-model)
             SHOW_MODEL=true
             shift
+            ;;
+        --by-harness)
+            SHOW_HARNESS=true
+            shift
+            ;;
+        --harness)
+            HARNESS_FILTER="${2,,}"
+            shift 2
             ;;
         -t|--total)
             SHOW_TOTAL=true
@@ -260,11 +272,12 @@ input as $first
   | map(tostring)
   | join(":");
 
-def record($timestamp; $req_id; $msg_id; $model; $usage; $cost):
+def record($timestamp; $req_id; $msg_id; $harness; $model; $usage; $cost):
   {
     day: ($timestamp | split("T")[0]),
     req_id: $req_id,
     msg_id: $msg_id,
+    harness: $harness,
     model: $model,
     input: ($usage.input_tokens // $usage.input // 0),
     output: ($usage.output_tokens // $usage.output // 0),
@@ -274,7 +287,7 @@ def record($timestamp; $req_id; $msg_id; $model; $usage; $cost):
   };
 
 if .type == "assistant" and .message.usage != null then
-  record(.timestamp; (.requestId // ""); (.message.id // "");
+  record(.timestamp; (.requestId // ""); (.message.id // ""); "claude";
          (.message.model // "unknown"); .message.usage; null)
 elif $is_pi
      and .type == "message"
@@ -285,19 +298,19 @@ elif $is_pi
      then (.message.responseModel // .message.model // "unknown")
      else "tools/summaries"
      end) as $model
-  | record(.timestamp; pi_req(.type; .timestamp); (.id // "");
+  | record(.timestamp; pi_req(.type; .timestamp); (.id // ""); "pi";
            $model; $usage; ($usage.cost.total // null))
 elif $is_pi
      and (.type == "compaction" or .type == "branch_summary")
      and .usage != null then
   .usage as $usage
-  | record(.timestamp; pi_req(.type; .timestamp); (.id // "");
+  | record(.timestamp; pi_req(.type; .timestamp); (.id // ""); "pi";
            "tools/summaries"; $usage; ($usage.cost.total // null))
 else
   empty
 end
 | [.day, .req_id, .msg_id, .model, .input, .output,
-   .cache_create, .cache_read, .cost]
+   .cache_create, .cache_read, .harness, .cost]
 | @tsv
 '
 
@@ -398,11 +411,13 @@ function fmt_num(n) {
     output = $6 + 0
     cache_create = $7 + 0
     cache_read = $8 + 0
-    recorded_cost = $9
+    harness = $9
+    recorded_cost = $10
     
     # Date filtering
     if (since != "" && day < since) next
     if (until != "" && day > until) next
+    if (harness_filter != "" && harness != harness_filter) next
     
     # Deduplication by msg_id:req_id
     if (msg_id != "" && req_id != "") {
@@ -425,6 +440,14 @@ function fmt_num(n) {
     dm_cache_create[dm] += cache_create
     dm_cache_read[dm] += cache_read
     day_models[dm] = 1
+
+    # Aggregate by day+harness
+    dh = day "\t" harness
+    dh_input[dh] += input
+    dh_output[dh] += output
+    dh_cache_create[dh] += cache_create
+    dh_cache_read[dh] += cache_read
+    day_harnesses[dh] = 1
     
     # Track models used per day
     if (!(day in models_by_day)) {
@@ -444,6 +467,7 @@ function fmt_num(n) {
     if (recorded_cost != "") c = recorded_cost + 0
     else c = get_cost(model, day, input, output, cache_create, cache_read)
     dm_cost_actual[dm] += c
+    dh_cost_actual[dh] += c
     day_cost_actual[day] += c
     total_cost_actual += c
 }
@@ -495,6 +519,28 @@ END {
             printf "  ],\n"
         }
         
+        # By harness array (if requested)
+        if (show_harness == "true") {
+            printf "  \"by_harness\": [\n"
+            h = asorti(day_harnesses, sorted_dh)
+            for (i = 1; i <= h; i++) {
+                dh = sorted_dh[i]
+                split(dh, parts, "\t")
+                day = parts[1]
+                harness = parts[2]
+                inp = dh_input[dh]
+                out = dh_output[dh]
+                cc = dh_cache_create[dh]
+                cr = dh_cache_read[dh]
+                cost = dh_cost_actual[dh]
+
+                printf "    {\"date\": \"%s\", \"harness\": \"%s\", \"input\": %d, \"output\": %d, \"cache_read\": %d, \"cache_create\": %d, \"cost_usd\": %.4f}", day, harness, inp, out, cr, cc, cost
+                if (i < h) printf ","
+                printf "\n"
+            }
+            printf "  ],\n"
+        }
+
         # Total (use accumulated per-model cost for accuracy)
         total_tokens = total_input + total_output + total_cache_create + total_cache_read
         printf "  \"total\": {\"input\": %d, \"output\": %d, \"cache_read\": %d, \"cache_create\": %d, \"total\": %d, \"cost_usd\": %.4f}\n", total_input, total_output, total_cache_read, total_cache_create, total_tokens, total_cost_actual
@@ -547,6 +593,29 @@ END {
             printf "──────────────────────────────────────────────────────────────────────\n"
         }
         
+        # By harness breakdown
+        if (show_harness == "true") {
+            printf "\nPer-Harness Breakdown:\n"
+            printf "%-12s %-12s %8s %8s %8s %8s %10s\n", "Date", "Harness", "Input", "Output", "Cache-R", "Cache-C", "Cost"
+            printf "──────────────────────────────────────────────────────────────────────────────────\n"
+
+            h = asorti(day_harnesses, sorted_dh)
+            for (i = 1; i <= h; i++) {
+                dh = sorted_dh[i]
+                split(dh, parts, "\t")
+                day = parts[1]
+                harness = parts[2]
+                inp = dh_input[dh]
+                out = dh_output[dh]
+                cc = dh_cache_create[dh]
+                cr = dh_cache_read[dh]
+                cost = dh_cost_actual[dh]
+
+                printf "%-12s %-12s %8s %8s %8s %8s %9.2f\n", day, harness, fmt_num(inp), fmt_num(out), fmt_num(cr), fmt_num(cc), cost
+            }
+            printf "──────────────────────────────────────────────────────────────────────────────────\n"
+        }
+
         # Total summary (use accumulated per-model cost for accuracy)
         total_tokens = total_input + total_output + total_cache_create + total_cache_read
         
@@ -605,6 +674,8 @@ main() {
         -v json="$JSON_OUTPUT" \
         -v show_daily="$SHOW_DAILY" \
         -v show_model="$SHOW_MODEL" \
+        -v show_harness="$SHOW_HARNESS" \
+        -v harness_filter="$HARNESS_FILTER" \
         -v show_total="$SHOW_TOTAL" \
         "$AWK_SCRIPT"
 }

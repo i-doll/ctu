@@ -28,6 +28,14 @@ struct Cli {
     #[arg(short = 'p', long = "by-provider")]
     by_provider: bool,
 
+    /// Include per-harness breakdown by day
+    #[arg(long = "by-harness")]
+    by_harness: bool,
+
+    /// Include only one harness (claude, codex, opencode, or pi)
+    #[arg(long, value_name = "NAME")]
+    harness: Option<String>,
+
     /// Show only total summary
     #[arg(short = 't', long)]
     total: bool,
@@ -51,6 +59,7 @@ struct OutputOptions {
     total: bool,
     model: bool,
     provider: bool,
+    harness: bool,
 }
 
 fn main() {
@@ -83,10 +92,18 @@ fn main() {
     let mut daily: BTreeMap<String, PeriodAgg> = BTreeMap::new();
     let mut by_model: BTreeMap<(String, String), PeriodAgg> = BTreeMap::new();
     let mut by_provider: BTreeMap<(String, String), PeriodAgg> = BTreeMap::new();
+    let mut by_harness: BTreeMap<(String, String), PeriodAgg> = BTreeMap::new();
     let mut total = PeriodAgg::default();
+    let harness_filter = cli.harness.as_ref().map(|name| name.to_ascii_lowercase());
 
     let data = DeduplicatedRecords::collect_with_opencode(&files, &opencode_files);
     for rec in &data.records {
+        if harness_filter
+            .as_ref()
+            .is_some_and(|harness| harness != &rec.harness)
+        {
+            continue;
+        }
         let Some(date) = rec.timestamp.get(..10) else {
             continue;
         };
@@ -130,6 +147,15 @@ fn main() {
         dp.cache_read += rec.cache_read;
         dp.cost += cost;
 
+        let dh = by_harness
+            .entry((date.to_string(), rec.harness.clone()))
+            .or_default();
+        dh.input += rec.input;
+        dh.output += rec.output;
+        dh.cache_create += rec.cache_create;
+        dh.cache_read += rec.cache_read;
+        dh.cost += cost;
+
         total.input += rec.input;
         total.output += rec.output;
         total.cache_create += rec.cache_create;
@@ -142,12 +168,27 @@ fn main() {
         total: show_total,
         model: cli.by_model,
         provider: cli.by_provider,
+        harness: cli.by_harness,
     };
 
     if cli.json {
-        print_json(&daily, &by_model, &by_provider, &total, options);
+        print_json(
+            &daily,
+            &by_model,
+            &by_provider,
+            &by_harness,
+            &total,
+            options,
+        );
     } else {
-        print_text(&daily, &by_model, &by_provider, &total, options);
+        print_text(
+            &daily,
+            &by_model,
+            &by_provider,
+            &by_harness,
+            &total,
+            options,
+        );
     }
 }
 
@@ -155,6 +196,7 @@ fn print_text(
     daily: &BTreeMap<String, PeriodAgg>,
     by_model: &BTreeMap<(String, String), PeriodAgg>,
     by_provider: &BTreeMap<(String, String), PeriodAgg>,
+    by_harness: &BTreeMap<(String, String), PeriodAgg>,
     total: &PeriodAgg,
     options: OutputOptions,
 ) {
@@ -246,6 +288,33 @@ fn print_text(
         writeln!(out, "{}", "─".repeat(86)).unwrap();
     }
 
+    if options.harness {
+        writeln!(out, "\nPer-Harness Breakdown:").unwrap();
+        writeln!(
+            out,
+            "{:<12} {:<12} {:>8} {:>8} {:>8} {:>8} {:>10}",
+            "Date", "Harness", "Input", "Output", "Cache-R", "Cache-C", "Cost"
+        )
+        .unwrap();
+        writeln!(out, "{}", "─".repeat(82)).unwrap();
+
+        for ((date, harness), agg) in by_harness {
+            writeln!(
+                out,
+                "{:<12} {:<12} {:>8} {:>8} {:>8} {:>8} {:>9.2}",
+                date,
+                harness,
+                fmt_num(agg.input),
+                fmt_num(agg.output),
+                fmt_num(agg.cache_read),
+                fmt_num(agg.cache_create),
+                agg.cost
+            )
+            .unwrap();
+        }
+        writeln!(out, "{}", "─".repeat(82)).unwrap();
+    }
+
     if options.daily || options.total {
         let t = total.input + total.output + total.cache_create + total.cache_read;
         writeln!(
@@ -289,6 +358,7 @@ fn print_json(
     daily: &BTreeMap<String, PeriodAgg>,
     by_model: &BTreeMap<(String, String), PeriodAgg>,
     by_provider: &BTreeMap<(String, String), PeriodAgg>,
+    by_harness: &BTreeMap<(String, String), PeriodAgg>,
     total: &PeriodAgg,
     options: OutputOptions,
 ) {
@@ -355,6 +425,24 @@ fn print_json(
             })
             .collect();
         root.insert("by_provider".into(), json!(provider_arr));
+    }
+
+    if options.harness {
+        let harness_arr: Vec<_> = by_harness
+            .iter()
+            .map(|((date, harness), agg)| {
+                json!({
+                    "date": date,
+                    "harness": harness,
+                    "input": agg.input,
+                    "output": agg.output,
+                    "cache_read": agg.cache_read,
+                    "cache_create": agg.cache_create,
+                    "cost_usd": (agg.cost * 10000.0).round() / 10000.0
+                })
+            })
+            .collect();
+        root.insert("by_harness".into(), json!(harness_arr));
     }
 
     root.insert("total".into(), total_obj);

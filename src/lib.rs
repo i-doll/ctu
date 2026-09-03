@@ -12,6 +12,7 @@ pub struct RawRecord {
     pub timestamp: String,
     pub req_id: String,
     pub msg_id: String,
+    pub harness: String,
     pub provider: String,
     pub model: String,
     pub cost_usd: Option<f64>,
@@ -682,6 +683,7 @@ fn parse_lines(lines: Vec<String>, source_id: &str) -> Vec<RawRecord> {
                 timestamp: jl.timestamp,
                 req_id: jl.request_id.unwrap_or_default(),
                 msg_id: msg.id.clone().unwrap_or_default(),
+                harness: "claude".to_string(),
                 provider: claude_provider(msg.model.as_deref().unwrap_or("unknown")).to_string(),
                 model: msg.model.clone().unwrap_or_else(|| "unknown".into()),
                 cost_usd: None,
@@ -724,6 +726,7 @@ fn parse_lines(lines: Vec<String>, source_id: &str) -> Vec<RawRecord> {
                 timestamp: jl.timestamp.clone(),
                 req_id: source_id.to_string(),
                 msg_id: format!("{}:{}", jl.timestamp, line_no + 1),
+                harness: "codex".to_string(),
                 provider: codex_provider.clone(),
                 model: codex_model.clone(),
                 cost_usd: None,
@@ -809,6 +812,7 @@ fn pi_usage_record(
         timestamp: line.timestamp.clone(),
         req_id,
         msg_id,
+        harness: "pi".to_string(),
         provider: provider.to_string(),
         model: model.to_string(),
         cost_usd: usage.cost.as_ref().and_then(|cost| cost.total),
@@ -958,6 +962,7 @@ fn parse_opencode_message(
             .id
             .or_else(|| fallback_id.map(str::to_string))
             .unwrap_or_default(),
+        harness: "opencode".to_string(),
         provider: message
             .provider_id
             .unwrap_or_else(|| "opencode".to_string()),
@@ -1202,6 +1207,7 @@ mod tests {
             timestamp: timestamp.to_string(),
             req_id: "req".into(),
             msg_id: "msg".into(),
+            harness: "test".into(),
             provider: "openai".into(),
             model: "gpt-5.6-sol".into(),
             cost_usd: None,
@@ -1270,6 +1276,7 @@ mod tests {
 
         let records = parse_lines(lines, "codex-session.jsonl");
         assert_eq!(records.len(), 2);
+        assert_eq!(records[0].harness, "claude");
         assert_eq!(records[0].provider, "anthropic");
         assert_eq!(records[0].model, "claude-sonnet-4-6");
         assert_eq!(
@@ -1280,6 +1287,7 @@ mod tests {
             ),
             (10, 3, 4)
         );
+        assert_eq!(records[1].harness, "codex");
         assert_eq!(records[1].model, "gpt-5.6-sol");
         assert_eq!(records[1].provider, "openai");
         assert_eq!(
@@ -1301,6 +1309,7 @@ mod tests {
 
         let records = parse_lines(lines, "pi-session.jsonl");
         assert_eq!(records.len(), 4);
+        assert_eq!(records[0].harness, "pi");
         assert_eq!(records[0].provider, "openrouter");
         assert_eq!(records[0].model, "gpt-5.6-sol");
         assert_eq!(
@@ -1429,6 +1438,7 @@ mod tests {
 
         let record = parse_opencode_message(data, None, None, None).unwrap();
         assert_eq!(record.timestamp, "1970-01-01T00:00:00.000Z");
+        assert_eq!(record.harness, "opencode");
         assert_eq!(record.provider, "openrouter");
         assert_eq!(record.model, "custom-model");
         assert_eq!((record.input, record.output), (6, 105));

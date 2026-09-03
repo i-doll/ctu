@@ -43,6 +43,7 @@ DAY_FILTER=""
 SINCE_DATE=""
 UNTIL_DATE=""
 DAYS_LIMIT=30
+HARNESS_FILTER=""
 SPLIT_MODE=false
 OPT_NO_COLOR=false
 
@@ -57,6 +58,7 @@ Options:
   -s, --since DATE    Filter from date (daily mode only)
   -u, --until DATE    Filter until date (daily mode only)
   -n, --days N        Show last N days (default: 30; 0 = all time)
+      --harness NAME  Include only one harness (claude or pi)
       --split         Two sub-bars per row: input+cache | output
       --no-color      Disable ANSI colors
   -v, --version       Show version
@@ -88,6 +90,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -n|--days)
             DAYS_LIMIT="$2"
+            shift 2
+            ;;
+        --harness)
+            HARNESS_FILTER="${2,,}"
             shift 2
             ;;
         --split)
@@ -189,11 +195,12 @@ input as $first
   | map(tostring)
   | join(":");
 
-def record($timestamp; $req_id; $msg_id; $model; $usage; $cost):
+def record($timestamp; $req_id; $msg_id; $harness; $model; $usage; $cost):
   {
     timestamp: $timestamp,
     req_id: $req_id,
     msg_id: $msg_id,
+    harness: $harness,
     model: $model,
     input: ($usage.input_tokens // $usage.input // 0),
     output: ($usage.output_tokens // $usage.output // 0),
@@ -203,7 +210,7 @@ def record($timestamp; $req_id; $msg_id; $model; $usage; $cost):
   };
 
 if .type == "assistant" and .message.usage != null then
-  record(.timestamp; (.requestId // ""); (.message.id // "");
+  record(.timestamp; (.requestId // ""); (.message.id // ""); "claude";
          (.message.model // "unknown"); .message.usage; null)
 elif $is_pi
      and .type == "message"
@@ -214,13 +221,13 @@ elif $is_pi
      then (.message.responseModel // .message.model // "unknown")
      else "tools/summaries"
      end) as $model
-  | record(.timestamp; pi_req(.type; .timestamp); (.id // "");
+  | record(.timestamp; pi_req(.type; .timestamp); (.id // ""); "pi";
            $model; $usage; ($usage.cost.total // null))
 elif $is_pi
      and (.type == "compaction" or .type == "branch_summary")
      and .usage != null then
   .usage as $usage
-  | record(.timestamp; pi_req(.type; .timestamp); (.id // "");
+  | record(.timestamp; pi_req(.type; .timestamp); (.id // ""); "pi";
            "tools/summaries"; $usage; ($usage.cost.total // null))
 else
   empty
@@ -231,7 +238,7 @@ build_daily_filter() {
     printf '%s\n' "$JQ_RECORD_FILTER"
     cat <<'JQEOF'
 | [(.timestamp | split("T")[0]), .req_id, .msg_id, .model,
-   .input, .output, .cache_create, .cache_read, .cost]
+   .input, .output, .cache_create, .cache_read, .harness, .cost]
 | @tsv
 JQEOF
 }
@@ -243,7 +250,7 @@ build_hourly_filter() {
     cat <<JQEOF
 | select(.timestamp | startswith("${day}"))
 | [(.timestamp | split("T")[1] | split(":")[0]), .req_id, .msg_id, .model,
-   .input, .output, .cache_create, .cache_read, .cost]
+   .input, .output, .cache_create, .cache_read, .harness, .cost]
 | @tsv
 JQEOF
 }
@@ -387,11 +394,13 @@ function render_bar(val, sc,    filled, bar, i) {
     out    = $6 + 0
     cc     = $7 + 0
     cr     = $8 + 0
-    recorded_cost = $9
+    harness = $9
+    recorded_cost = $10
 
     # Date filtering (daily mode)
     if (since != "" && period < since) next
     if (until != "" && period > until) next
+    if (harness_filter != "" && harness != harness_filter) next
 
     # Deduplication by msg_id:req_id
     if (msg_id != "" && req_id != "") {
@@ -463,6 +472,7 @@ END {
     } else {
         hdr = "Daily token usage · last " days_limit " days"
     }
+    if (harness_filter != "") hdr = hdr " · harness " harness_filter
     printf "%s%s · scale: █ = %s tokens%s\n\n", C_HDR, hdr, fmt_num(sc), C_RESET
 
     # Data rows
@@ -562,6 +572,7 @@ main() {
         -v until="$UNTIL_DATE" \
         -v days_limit="$DAYS_LIMIT" \
         -v split_mode="$SPLIT_MODE" \
+        -v harness_filter="$HARNESS_FILTER" \
         -v colors_off="$colors_off" \
         -v hourly_mode="$hourly" \
         -v day_filter="$DAY_FILTER" \

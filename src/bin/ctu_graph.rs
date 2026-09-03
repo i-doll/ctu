@@ -33,6 +33,10 @@ struct Cli {
     #[arg(short = 'n', long, default_value = "30")]
     days: usize,
 
+    /// Include only one harness (claude, codex, opencode, or pi)
+    #[arg(long, value_name = "NAME")]
+    harness: Option<String>,
+
     /// Two sub-bars per row
     #[arg(long)]
     split: bool,
@@ -129,9 +133,16 @@ fn main() {
     // Aggregate
     let mut periods: BTreeMap<String, PeriodAgg> = BTreeMap::new();
     let mut grand = PeriodAgg::default();
+    let harness_filter = cli.harness.as_ref().map(|name| name.to_ascii_lowercase());
 
     let data = DeduplicatedRecords::collect_with_opencode(&files, &opencode_files);
     for rec in &data.records {
+        if harness_filter
+            .as_ref()
+            .is_some_and(|harness| harness != &rec.harness)
+        {
+            continue;
+        }
         let ts = &rec.timestamp;
         if ts.len() < 13 {
             continue;
@@ -227,13 +238,16 @@ fn main() {
     let scale = nice_scale(max_val as f64 / bar_area as f64).max(1);
 
     // Header
-    let hdr_txt = if hourly_mode {
+    let mut hdr_txt = if hourly_mode {
         format!("Hourly breakdown · {}", day_str)
     } else if cli.days == 0 {
         "Daily token usage · all time".to_string()
     } else {
         format!("Daily token usage · last {} days", cli.days)
     };
+    if let Some(harness) = harness_filter.as_ref() {
+        hdr_txt.push_str(&format!(" · harness {harness}"));
+    }
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();

@@ -116,15 +116,68 @@ struct OpenCodeTime {
 // ── Pricing table ────────────────────────────────────────────────────────────
 
 // Standard processing prices in USD per million tokens. More-specific model
-// prefixes must precede their families. `long_context` selects OpenAI's >272K
-// input tier (2x input/cache and 1.5x output for the full request).
+// prefixes must precede their families. `long_context` is `(threshold, output
+// multiplier)`: above `threshold` input tokens the whole request bills at 2x
+// input/cache and the given output multiplier. OpenAI charges 1.5x output over
+// 272K and Gemini Pro the same over 200K; xAI doubles every rate over 200K.
+// Providers whose cache writes carry no separate charge (OpenAI, Google, xAI,
+// Moonshot) set `cache_create` equal to `input` — those tokens bill as
+// ordinary input.
+//
+// A model whose price changes on a date gets one entry per window, chained with
+// `.until(date)` / `.from(date)`. Bounds are `YYYY-MM-DD` strings compared
+// lexically against the record's date, `from` inclusive and `until` exclusive,
+// so adjacent windows share a boundary date without overlapping:
+//
+//     price!("claude-sonnet-5", 2.00, 10.00, 2.50, 0.20).until("2026-09-01"),
+//     price!("claude-sonnet-5", 3.00, 15.00, 3.75, 0.30).from("2026-09-01"),
+//
+// Order windows oldest-first and keep them adjacent, since lookup takes the
+// first entry whose prefix and date both match. An undated entry matches every
+// date, so it must come last within a model's group — anything after it is
+// unreachable. A date outside every window for a prefix falls through to the
+// next matching entry, or to $0 if there is none.
 struct ModelPricing {
     prefix: &'static str,
     input: f64,
     output: f64,
     cache_create: f64,
     cache_read: f64,
-    long_context: bool,
+    long_context: Option<(u64, f64)>,
+    /// Inclusive lower bound, `YYYY-MM-DD`. `None` = no lower bound.
+    from: Option<&'static str>,
+    /// Exclusive upper bound, `YYYY-MM-DD`. `None` = no upper bound.
+    until: Option<&'static str>,
+}
+
+impl ModelPricing {
+    /// Restrict this entry to records dated on or after `date` (inclusive).
+    const fn from(mut self, date: &'static str) -> Self {
+        self.from = Some(date);
+        self
+    }
+
+    /// Restrict this entry to records dated strictly before `date`.
+    const fn until(mut self, date: &'static str) -> Self {
+        self.until = Some(date);
+        self
+    }
+
+    /// Whether this entry applies on `date` (`YYYY-MM-DD`). An entry with no
+    /// bounds applies to every date, so undated tables behave as before.
+    fn covers(&self, date: &str) -> bool {
+        if let Some(from) = self.from {
+            if date < from {
+                return false;
+            }
+        }
+        if let Some(until) = self.until {
+            if date >= until {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 macro_rules! price {
@@ -135,17 +188,24 @@ macro_rules! price {
             output: $output,
             cache_create: $cache_create,
             cache_read: $cache_read,
-            long_context: false,
+            long_context: None,
+            from: None,
+            until: None,
         }
     };
     ($prefix:expr, $input:expr, $output:expr, $cache_create:expr, $cache_read:expr, long) => {
+        price!($prefix, $input, $output, $cache_create, $cache_read, long 272_000, 1.5)
+    };
+    ($prefix:expr, $input:expr, $output:expr, $cache_create:expr, $cache_read:expr, long $threshold:expr, $output_factor:expr) => {
         ModelPricing {
             prefix: $prefix,
             input: $input,
             output: $output,
             cache_create: $cache_create,
             cache_read: $cache_read,
-            long_context: true,
+            long_context: Some(($threshold, $output_factor)),
+            from: None,
+            until: None,
         }
     };
 }
@@ -184,8 +244,44 @@ static PRICING: &[ModelPricing] = &[
     price!("gpt-4o-2024-05-13", 5.00, 15.00, 5.00, 5.00),
     price!("gpt-4o-mini", 0.15, 0.60, 0.15, 0.075),
     price!("gpt-4o", 2.50, 10.00, 2.50, 1.25),
+    // Open-weight; the rate depends entirely on who hosts it (roughly
+    // $0.04-$0.15 in / $0.15-$0.75 out per MTok). Priced at the mid-range
+    // OpenRouter rate rather than left unpriced.
+    price!("gpt-oss-120b", 0.10, 0.50, 0.10, 0.10),
+    // Google Gemini — cache reads are 10% of input; the per-hour storage fee on
+    // explicit caches is not billed per token, so it is out of scope here.
+    // Only Pro carries a long-context surcharge (>200K), Flash bills flat.
+    price!("gemini-3.6-flash", 1.50, 7.50, 1.50, 0.15),
+    price!("gemini-3.5-flash-lite", 0.30, 2.50, 0.30, 0.03),
+    price!("gemini-3.5-flash", 1.50, 9.00, 1.50, 0.15),
+    price!("gemini-3.1-flash-lite", 0.25, 1.50, 0.25, 0.025),
+    price!("gemini-3.1-pro", 2.00, 12.00, 2.00, 0.20, long 200_000, 1.5),
+    price!("gemini-3-flash", 0.50, 3.00, 0.50, 0.05),
+    // The proxy's "gemini-pro-agent" alias tracks the current Pro tier.
+    price!("gemini-pro", 2.00, 12.00, 2.00, 0.20, long 200_000, 1.5),
+    // xAI Grok — every rate doubles above 200K input tokens.
+    price!("grok-4.5", 2.00, 6.00, 2.00, 0.50, long 200_000, 2.0),
+    price!("grok-4.3", 1.25, 2.50, 1.25, 0.20, long 200_000, 2.0),
+    price!("grok-4.20", 1.25, 2.50, 1.25, 0.20, long 200_000, 2.0),
+    price!("grok-build", 1.00, 2.00, 1.00, 0.20, long 200_000, 2.0),
+    price!("grok-composer-2.5", 1.25, 2.50, 1.25, 0.20, long 200_000, 2.0),
+    price!("grok-3-mini", 0.30, 0.50, 0.30, 0.075),
+    // Moonshot Kimi — cache hits are ~10% of input; no long-context surcharge.
+    price!("kimi-k3", 3.00, 15.00, 3.00, 0.30),
+    price!("kimi-k2.7-code", 0.95, 4.00, 0.95, 0.19),
+    price!("kimi-k2.6", 0.95, 4.00, 0.95, 0.19),
+    price!("kimi-k2.5", 0.60, 3.00, 0.60, 0.19),
+    price!("kimi-k2-thinking", 0.60, 2.50, 0.60, 0.15),
+    price!("kimi-k2", 0.55, 2.20, 0.55, 0.15),
     // Fable 5 — $10 / $50 per MTok
     price!("claude-fable-5", 10.00, 50.00, 12.50, 1.00),
+    // Opus 5 — $5 / $25 per MTok
+    price!("claude-opus-5", 5.00, 25.00, 6.25, 0.50),
+    // Sonnet 5 — introductory $2 / $10 per MTok through 2026-08-31, then the
+    // $3 / $15 list price from 2026-09-01. Cache rates scale with input
+    // (write 1.25x, read 0.1x), so they shift with it.
+    price!("claude-sonnet-5", 2.00, 10.00, 2.50, 0.20).until("2026-09-01"),
+    price!("claude-sonnet-5", 3.00, 15.00, 3.75, 0.30).from("2026-09-01"),
     // Opus — $5 / $25 per MTok (Opus 4.5 through 4.8)
     price!("claude-opus-4-8", 5.00, 25.00, 6.25, 0.50),
     price!("claude-opus-4-7", 5.00, 25.00, 6.25, 0.50),
@@ -202,6 +298,18 @@ static PRICING: &[ModelPricing] = &[
     price!("claude-haiku-4-5", 1.00, 5.00, 1.25, 0.10),
     // Haiku 3.5 — $0.80 / $4 per MTok (retired on the first-party API)
     price!("claude-3-5-haiku", 0.80, 4.00, 1.00, 0.08),
+    // Sonnet 3.7 — $3 / $15 per MTok (retired on the first-party API)
+    price!("claude-3-7-sonnet", 3.00, 15.00, 3.75, 0.30),
+    // Bare tier aliases that harnesses log instead of a resolved model id
+    // (subagent short names, workflow model defaults). Each is priced at the
+    // current model in its tier, so they read as approximately right rather
+    // than as $0. Keep last: these prefixes are short and would otherwise
+    // shadow the specific ids above.
+    price!("gemini-default", 1.50, 9.00, 1.50, 0.15),
+    price!("fable", 10.00, 50.00, 12.50, 1.00),
+    price!("opus", 5.00, 25.00, 6.25, 0.50),
+    price!("sonnet", 3.00, 15.00, 3.75, 0.30),
+    price!("haiku", 1.00, 5.00, 1.25, 0.10),
 ];
 
 // ── Public functions ─────────────────────────────────────────────────────────
@@ -237,19 +345,36 @@ pub fn normalize_model(m: &str) -> String {
     m.to_string()
 }
 
+/// Sentinel date meaning "the most recent price window". Sorts after any real
+/// `YYYY-MM-DD`, so it selects the open-ended final window rather than baking a
+/// build-time date into the binary.
+const LATEST_RATES: &str = "9999-12-31";
+
+/// Cost of a request priced at the latest known rates. Prefer [`get_cost_on`]
+/// for stored records: a model with dated price windows should bill at
+/// whichever window covers the record's own date, not the current one.
 pub fn get_cost(model: &str, inp: u64, out: u64, cc: u64, cr: u64) -> f64 {
+    get_cost_on(model, LATEST_RATES, inp, out, cc, cr)
+}
+
+/// Cost of a request made on `date` (`YYYY-MM-DD`), honoring dated price
+/// windows. A date matching no window for the model contributes $0, same as an
+/// unpriced model.
+pub fn get_cost_on(model: &str, date: &str, inp: u64, out: u64, cc: u64, cr: u64) -> f64 {
     let norm = normalize_model(model);
     // Unknown / unpriced models (e.g. "<synthetic>") contribute $0 so they
     // are obvious in reports rather than silently billed at some default rate.
     match PRICING
         .iter()
-        .find(|pricing| norm.starts_with(pricing.prefix))
+        .find(|pricing| norm.starts_with(pricing.prefix) && pricing.covers(date))
     {
         Some(pricing) => {
             let input_tokens = inp.saturating_add(cc).saturating_add(cr);
-            let long = pricing.long_context && input_tokens > 272_000;
-            let input_factor = if long { 2.0 } else { 1.0 };
-            let output_factor = if long { 1.5 } else { 1.0 };
+            let long = pricing
+                .long_context
+                .filter(|(threshold, _)| input_tokens > *threshold);
+            let input_factor = if long.is_some() { 2.0 } else { 1.0 };
+            let output_factor = long.map_or(1.0, |(_, factor)| factor);
             (inp as f64 * pricing.input * input_factor
                 + out as f64 * pricing.output * output_factor
                 + cc as f64 * pricing.cache_create * input_factor
@@ -262,8 +387,14 @@ pub fn get_cost(model: &str, inp: u64, out: u64, cc: u64, cr: u64) -> f64 {
 
 pub fn get_record_cost(record: &RawRecord) -> f64 {
     record.cost_usd.unwrap_or_else(|| {
-        get_cost(
+        // Price against the record's own date so historical rows keep billing
+        // at the rate that was in effect when they were made. Timestamps are
+        // ISO-8601, so the leading 10 chars are the `YYYY-MM-DD` date; a
+        // malformed timestamp falls back to the latest rates.
+        let date = record.timestamp.get(..10).unwrap_or(LATEST_RATES);
+        get_cost_on(
             &record.model,
+            date,
             record.input,
             record.output,
             record.cache_create,
@@ -514,9 +645,59 @@ fn claude_provider(model: &str) -> &'static str {
         "google-vertex"
     } else if model.starts_with("anthropic.") || model.contains(".anthropic.") {
         "amazon-bedrock"
-    } else {
+    } else if is_openai_model(model) {
+        "openai"
+    } else if is_anthropic_model(model) {
         "anthropic"
+    } else if is_google_model(model) {
+        "google"
+    } else if is_xai_model(model) {
+        "xai"
+    } else if is_moonshot_model(model) {
+        "moonshotai"
+    } else {
+        "unknown"
     }
+}
+
+fn is_openai_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.starts_with("gpt-")
+        || model.starts_with("chatgpt-")
+        || model.starts_with("codex-")
+        || model_family(&model, "o1")
+        || model_family(&model, "o3")
+        || model_family(&model, "o4")
+}
+
+fn is_anthropic_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.starts_with("claude-") || matches!(model.as_str(), "opus" | "sonnet" | "haiku" | "fable")
+}
+
+fn is_google_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    // Gemma ids vary in separator ("gemma-3-27b-it", "gemma3:4b"), so match the
+    // bare family name; no other vendor uses it.
+    model_family(&model, "gemini") || model.starts_with("gemma")
+}
+
+fn is_xai_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model_family(&model, "grok")
+}
+
+fn is_moonshot_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model_family(&model, "kimi") || model_family(&model, "moonshot")
+}
+
+fn model_family(model: &str, family: &str) -> bool {
+    model == family
+        || model
+            .strip_prefix(family)
+            .map(|suffix| suffix.starts_with('-'))
+            .unwrap_or(false)
 }
 
 fn read_opencode_records(path: &Path) -> Vec<RawRecord> {
@@ -711,6 +892,130 @@ mod tests {
     }
 
     #[test]
+    fn prices_google_xai_and_moonshot_models() {
+        assert_close(
+            get_cost("gemini-3.5-flash", 1_000_000, 1_000_000, 0, 0),
+            10.50,
+        );
+        assert_close(get_cost("gemini-3.5-flash-low", 1_000_000, 0, 0, 0), 1.50);
+        // Kept under each provider's long-context threshold to test base rates;
+        // the surcharges have their own test below.
+        assert_close(get_cost("gemini-3.1-pro", 100_000, 100_000, 0, 0), 1.40);
+        assert_close(get_cost("grok-4.5", 100_000, 100_000, 0, 0), 0.80);
+        assert_close(get_cost("grok-4.5-build-free", 100_000, 0, 0, 0), 0.20);
+        assert_close(get_cost("kimi-k3", 1_000_000, 1_000_000, 0, 0), 18.00);
+        assert_close(get_cost("kimi-k2.6", 1_000_000, 1_000_000, 0, 0), 4.95);
+    }
+
+    #[test]
+    fn prices_bare_tier_aliases_at_current_tier_rates() {
+        assert_close(get_cost("opus", 1_000_000, 0, 0, 0), 5.00);
+        assert_close(get_cost("sonnet", 1_000_000, 0, 0, 0), 3.00);
+        assert_close(get_cost("haiku", 1_000_000, 0, 0, 0), 1.00);
+        assert_close(get_cost("fable", 1_000_000, 0, 0, 0), 10.00);
+        assert_close(get_cost("gemini-default", 1_000_000, 0, 0, 0), 1.50);
+        // The aliases must not shadow fully-qualified ids that share a prefix.
+        assert_close(get_cost("claude-opus-4-1", 1_000_000, 0, 0, 0), 15.00);
+        assert_close(get_cost("gemini-3.5-flash-lite", 1_000_000, 0, 0, 0), 0.30);
+    }
+
+    #[test]
+    fn prices_dated_windows_by_record_date() {
+        // Sonnet 5 introductory rate: $2 / $10 per MTok through 2026-08-31.
+        assert_close(
+            get_cost_on("claude-sonnet-5", "2026-07-25", 1_000_000, 1_000_000, 0, 0),
+            12.00,
+        );
+        // Last day of the intro window still bills at the intro rate.
+        assert_close(
+            get_cost_on("claude-sonnet-5", "2026-08-31", 1_000_000, 0, 0, 0),
+            2.00,
+        );
+        // `until` is exclusive, so the boundary date itself is list price.
+        assert_close(
+            get_cost_on("claude-sonnet-5", "2026-09-01", 1_000_000, 1_000_000, 0, 0),
+            18.00,
+        );
+        assert_close(
+            get_cost_on("claude-sonnet-5", "2027-03-14", 1_000_000, 0, 0, 0),
+            3.00,
+        );
+        // Cache rates shift with the window too.
+        assert_close(
+            get_cost_on("claude-sonnet-5", "2026-07-25", 0, 0, 1_000_000, 1_000_000),
+            2.70,
+        );
+        assert_close(
+            get_cost_on("claude-sonnet-5", "2026-09-01", 0, 0, 1_000_000, 1_000_000),
+            4.05,
+        );
+        // A dateless call bills at the latest window, not the intro rate.
+        assert_close(get_cost("claude-sonnet-5", 1_000_000, 0, 0, 0), 3.00);
+    }
+
+    #[test]
+    fn undated_models_ignore_the_record_date() {
+        for date in ["2024-01-01", "2026-07-25", "2099-12-31"] {
+            assert_close(get_cost_on("claude-opus-5", date, 1_000_000, 0, 0, 0), 5.00);
+            // Kept under 272K so the long-context surcharge stays out of it.
+            assert_close(get_cost_on("gpt-5.6-sol", date, 100_000, 0, 0, 0), 0.50);
+            assert_close(get_cost_on("kimi-k3", date, 1_000_000, 0, 0, 0), 3.00);
+        }
+    }
+
+    #[test]
+    fn prices_records_at_their_own_date() {
+        let dated = |timestamp: &str| RawRecord {
+            timestamp: timestamp.to_string(),
+            req_id: "req".into(),
+            msg_id: "msg".into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-5".into(),
+            cost_usd: None,
+            input: 1_000_000,
+            output: 0,
+            cache_create: 0,
+            cache_read: 0,
+        };
+
+        // A record from the intro window keeps billing at the intro rate even
+        // after the list price takes effect.
+        assert_close(get_record_cost(&dated("2026-07-25T10:00:00Z")), 2.00);
+        assert_close(get_record_cost(&dated("2026-09-01T10:00:00Z")), 3.00);
+        // A malformed timestamp falls back to the latest rates rather than $0.
+        assert_close(get_record_cost(&dated("bogus")), 3.00);
+
+        // A recorded cost still wins over the table, dated windows included.
+        let mut recorded = dated("2026-07-25T10:00:00Z");
+        recorded.cost_usd = Some(42.0);
+        assert_close(get_record_cost(&recorded), 42.0);
+    }
+
+    #[test]
+    fn prices_claude_5_family_and_retired_sonnet() {
+        assert_close(get_cost("claude-opus-5", 1_000_000, 1_000_000, 0, 0), 30.00);
+        assert_close(
+            get_cost("claude-sonnet-5", 1_000_000, 1_000_000, 0, 0),
+            18.00,
+        );
+        assert_close(
+            get_cost("claude-3-7-sonnet-20250219", 1_000_000, 0, 0, 0),
+            3.00,
+        );
+    }
+
+    #[test]
+    fn applies_provider_specific_long_context_thresholds() {
+        // Gemini Pro bills the surcharge above 200K, not OpenAI's 272K.
+        assert_close(get_cost("gemini-3.1-pro", 200_001, 0, 0, 0), 0.800004);
+        assert_close(get_cost("gemini-3.1-pro", 200_000, 0, 0, 0), 0.400000);
+        // xAI doubles output too, rather than applying OpenAI's 1.5x.
+        assert_close(get_cost("grok-4.5", 200_001, 100_000, 0, 0), 2.000004);
+        // Gemini Flash bills flat at any size.
+        assert_close(get_cost("gemini-3.5-flash", 1_000_000, 0, 0, 0), 1.50);
+    }
+
+    #[test]
     fn parses_claude_and_codex_records() {
         let lines = vec![
             r#"{"type":"assistant","timestamp":"2026-07-09T10:00:00Z","requestId":"req","message":{"id":"msg","model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":2,"cache_creation_input_tokens":3,"cache_read_input_tokens":4}}}"#.to_string(),
@@ -741,8 +1046,21 @@ mod tests {
     }
 
     #[test]
-    fn infers_claude_hosting_provider() {
+    fn attributes_openai_models_in_claude_logs_to_openai() {
+        let lines = vec![
+            r#"{"type":"assistant","timestamp":"2026-07-18T10:00:00Z","requestId":"req","message":{"id":"msg","model":"gpt-5.6-sol","usage":{"input_tokens":10,"output_tokens":2}}}"#.to_string(),
+        ];
+
+        let records = parse_lines(lines, "claude-session.jsonl");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].model, "gpt-5.6-sol");
+        assert_eq!(records[0].provider, "openai");
+    }
+
+    #[test]
+    fn infers_claude_log_provider_from_hosting_or_model() {
         assert_eq!(claude_provider("claude-sonnet-4-6"), "anthropic");
+        assert_eq!(claude_provider("sonnet"), "anthropic");
         assert_eq!(
             claude_provider("us.anthropic.claude-sonnet-4-6-v1:0"),
             "amazon-bedrock"
@@ -755,6 +1073,19 @@ mod tests {
             claude_provider("claude-sonnet-4-6@20260217"),
             "google-vertex"
         );
+        assert_eq!(claude_provider("gpt-5.6-sol"), "openai");
+        assert_eq!(claude_provider("gpt-4o"), "openai");
+        assert_eq!(claude_provider("o3"), "openai");
+        assert_eq!(claude_provider("o4-mini"), "openai");
+        assert_eq!(claude_provider("codex-mini-latest"), "openai");
+        assert_eq!(claude_provider("gemini-3.5-flash-low"), "google");
+        assert_eq!(claude_provider("gemini-default"), "google");
+        assert_eq!(claude_provider("gemma-3-27b-it"), "google");
+        assert_eq!(claude_provider("grok-4.5"), "xai");
+        assert_eq!(claude_provider("grok-4.5-build-free"), "xai");
+        assert_eq!(claude_provider("kimi-k3"), "moonshotai");
+        assert_eq!(claude_provider("moonshot-v1-8k"), "moonshotai");
+        assert_eq!(claude_provider("<synthetic>"), "unknown");
     }
 
     #[test]

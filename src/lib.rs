@@ -20,6 +20,11 @@ pub struct RawRecord {
     pub output: u64,
     pub cache_create: u64,
     pub cache_read: u64,
+    /// The part of `cache_create` written with a 1-hour TTL, billed at 2x
+    /// input instead of the 5-minute 1.25x. Only Claude logs the split.
+    pub cache_create_1h: u64,
+    /// Served in fast mode (Claude `speed: "fast"`, Codex `service_tier: "fast"`).
+    pub fast: bool,
 }
 
 #[derive(Default, Clone)]
@@ -68,6 +73,13 @@ struct JsonUsage {
     #[serde(alias = "cacheRead")]
     cache_read_input_tokens: Option<u64>,
     cost: Option<JsonCost>,
+    speed: Option<String>,
+    cache_creation: Option<JsonCacheCreation>,
+}
+
+#[derive(Deserialize)]
+struct JsonCacheCreation {
+    ephemeral_1h_input_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -82,6 +94,12 @@ struct CodexPayload {
     model: Option<String>,
     model_provider: Option<String>,
     info: Option<CodexTokenInfo>,
+    thread_settings: Option<CodexThreadSettings>,
+}
+
+#[derive(Deserialize)]
+struct CodexThreadSettings {
+    service_tier: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -165,6 +183,9 @@ struct ModelPricing {
     from: Option<&'static str>,
     /// Exclusive upper bound, `YYYY-MM-DD`. `None` = no upper bound.
     until: Option<&'static str>,
+    /// Fast-mode multiplier on every rate. `None` = no fast mode, so a record
+    /// flagged fast bills at standard rates.
+    fast: Option<f64>,
 }
 
 impl ModelPricing {
@@ -177,6 +198,12 @@ impl ModelPricing {
     /// Restrict this entry to records dated strictly before `date`.
     const fn until(mut self, date: &'static str) -> Self {
         self.until = Some(date);
+        self
+    }
+
+    /// Price fast-mode records at `factor` times every standard rate.
+    const fn fast(mut self, factor: f64) -> Self {
+        self.fast = Some(factor);
         self
     }
 
@@ -208,6 +235,7 @@ macro_rules! price {
             long_context: None,
             from: None,
             until: None,
+            fast: None,
         }
     };
     ($prefix:expr, $input:expr, $output:expr, $cache_create:expr, $cache_read:expr, long) => {
@@ -223,33 +251,44 @@ macro_rules! price {
             long_context: Some(($threshold, $output_factor)),
             from: None,
             until: None,
+            fast: None,
         }
     };
 }
 
 static PRICING: &[ModelPricing] = &[
+    // OpenAI GPT-6 — cache writes are 1.25x uncached input, as on GPT-5.6.
+    price!("gpt-6-astra", 10.00, 50.00, 12.50, 1.00, long).fast(2.0),
+    price!("gpt-6-sol", 2.00, 10.00, 2.50, 0.20, long).fast(2.0),
+    price!("gpt-6-luna", 0.10, 0.50, 0.125, 0.01, long).fast(2.0),
     // OpenAI GPT-5.6 — cache writes are 1.25x uncached input. Terra and Luna
     // were cut on 2026-07-30 and Sol on 2026-08-21; the Sol rate is billed as
     // promotional "at least through 2026-11-21" with no later price announced,
     // so its window stays open-ended.
     price!("gpt-5.6-terra", 2.50, 15.00, 3.125, 0.25, long).until("2026-07-30"),
-    price!("gpt-5.6-terra", 2.00, 12.00, 2.50, 0.20, long).from("2026-07-30"),
+    price!("gpt-5.6-terra", 2.00, 12.00, 2.50, 0.20, long)
+        .from("2026-07-30")
+        .fast(2.0),
     price!("gpt-5.6-luna", 1.00, 6.00, 1.25, 0.10, long).until("2026-07-30"),
-    price!("gpt-5.6-luna", 0.20, 1.20, 0.25, 0.02, long).from("2026-07-30"),
+    price!("gpt-5.6-luna", 0.20, 1.20, 0.25, 0.02, long)
+        .from("2026-07-30")
+        .fast(2.0),
     price!("gpt-5.6-sol", 5.00, 30.00, 6.25, 0.50, long).until("2026-08-21"),
-    price!("gpt-5.6-sol", 4.00, 20.00, 5.00, 0.40, long).from("2026-08-21"),
+    price!("gpt-5.6-sol", 4.00, 20.00, 5.00, 0.40, long)
+        .from("2026-08-21")
+        .fast(2.0),
     // Cyber variants have no long-context tier.
     price!("gpt-5.6-cyber", 12.50, 75.00, 15.625, 1.25),
     // There is no plain "gpt-5.6"; an unrecognised 5.6 variant bills at Sol.
-    price!("gpt-5.6", 4.00, 20.00, 5.00, 0.40, long),
+    price!("gpt-5.6", 4.00, 20.00, 5.00, 0.40, long).fast(2.0),
     // Current general models available in Codex.
     price!("gpt-5.5-cyber", 12.50, 75.00, 15.625, 1.25),
     price!("gpt-5.5-pro", 30.00, 180.00, 30.00, 30.00, long),
-    price!("gpt-5.5", 5.00, 30.00, 5.00, 0.50, long),
-    price!("gpt-5.4-mini", 0.75, 4.50, 0.75, 0.075),
+    price!("gpt-5.5", 5.00, 30.00, 5.00, 0.50, long).fast(2.5),
+    price!("gpt-5.4-mini", 0.75, 4.50, 0.75, 0.075).fast(2.0),
     price!("gpt-5.4-nano", 0.20, 1.25, 0.20, 0.02),
     price!("gpt-5.4-pro", 30.00, 180.00, 30.00, 30.00, long),
-    price!("gpt-5.4", 2.50, 15.00, 2.50, 0.25, long),
+    price!("gpt-5.4", 2.50, 15.00, 2.50, 0.25, long).fast(2.0),
     // Legacy Codex model families.
     price!("gpt-5.3-codex", 1.75, 14.00, 1.75, 0.175),
     price!("gpt-5.2-codex", 1.75, 14.00, 1.75, 0.175),
@@ -316,14 +355,17 @@ static PRICING: &[ModelPricing] = &[
     // Fable 5 / Mythos 5 — $10 / $50 per MTok
     price!("claude-fable-5", 10.00, 50.00, 12.50, 1.00),
     price!("claude-mythos-5", 10.00, 50.00, 12.50, 1.00),
+    // Opus 5.5 — $4 / $20 per MTok; cache reads are 5% of input ($0.20).
+    // Must precede the Opus 5 prefix.
+    price!("claude-opus-5-5", 4.00, 20.00, 5.00, 0.20).fast(2.0),
     // Opus 5 — $5 / $25 per MTok
-    price!("claude-opus-5", 5.00, 25.00, 6.25, 0.50),
+    price!("claude-opus-5", 5.00, 25.00, 6.25, 0.50).fast(2.0),
     // Sonnet 5 — $2 / $10 per MTok. Launched as an introductory rate through
     // 2026-08-31; Anthropic later made it the standard price and cancelled
     // the planned $3 / $15 step, so there is no dated window.
     price!("claude-sonnet-5", 2.00, 10.00, 2.50, 0.20),
     // Opus — $5 / $25 per MTok (Opus 4.5 through 4.8)
-    price!("claude-opus-4-8", 5.00, 25.00, 6.25, 0.50),
+    price!("claude-opus-4-8", 5.00, 25.00, 6.25, 0.50).fast(2.0),
     price!("claude-opus-4-7", 5.00, 25.00, 6.25, 0.50),
     price!("claude-opus-4-6", 5.00, 25.00, 6.25, 0.50),
     price!("claude-opus-4-5", 5.00, 25.00, 6.25, 0.50),
@@ -347,8 +389,8 @@ static PRICING: &[ModelPricing] = &[
     // shadow the specific ids above.
     price!("gemini-default", 1.50, 9.00, 1.50, 0.15),
     price!("fable", 10.00, 50.00, 12.50, 0.25),
-    price!("opus", 5.00, 25.00, 6.25, 0.50),
-    price!("sonnet", 3.00, 15.00, 3.75, 0.30),
+    price!("opus", 4.00, 20.00, 5.00, 0.20).fast(2.0),
+    price!("sonnet", 2.00, 10.00, 2.50, 0.20),
     price!("haiku", 1.00, 5.00, 1.25, 0.10),
 ];
 
@@ -401,6 +443,35 @@ pub fn get_cost(model: &str, inp: u64, out: u64, cc: u64, cr: u64) -> f64 {
 /// windows. A date matching no window for the model contributes $0, same as an
 /// unpriced model.
 pub fn get_cost_on(model: &str, date: &str, inp: u64, out: u64, cc: u64, cr: u64) -> f64 {
+    let tokens = Tokens {
+        input: inp,
+        output: out,
+        cache_create: cc,
+        cache_create_1h: 0,
+        cache_read: cr,
+    };
+    cost_on(model, date, false, &tokens)
+}
+
+#[derive(Clone, Copy)]
+struct Tokens {
+    input: u64,
+    output: u64,
+    cache_create: u64,
+    /// Subset of `cache_create`.
+    cache_create_1h: u64,
+    cache_read: u64,
+}
+
+/// [`get_cost_on`], with `fast` selecting the model's fast-mode rates.
+fn cost_on(model: &str, date: &str, fast: bool, tokens: &Tokens) -> f64 {
+    let Tokens {
+        input: inp,
+        output: out,
+        cache_create: cc,
+        cache_create_1h: cc_1h,
+        cache_read: cr,
+    } = *tokens;
     let norm = normalize_model(model);
     // Unknown / unpriced models (e.g. "<synthetic>") contribute $0 so they
     // are obvious in reports rather than silently billed at some default rate.
@@ -415,10 +486,13 @@ pub fn get_cost_on(model: &str, date: &str, inp: u64, out: u64, cc: u64, cr: u64
                 .filter(|(threshold, _)| input_tokens > *threshold);
             let input_factor = if long.is_some() { 2.0 } else { 1.0 };
             let output_factor = long.map_or(1.0, |(_, factor)| factor);
-            (inp as f64 * pricing.input * input_factor
-                + out as f64 * pricing.output * output_factor
-                + cc as f64 * pricing.cache_create * input_factor
-                + cr as f64 * pricing.cache_read * input_factor)
+            let speed_factor = pricing.fast.filter(|_| fast).unwrap_or(1.0);
+            speed_factor
+                * (inp as f64 * pricing.input * input_factor
+                    + out as f64 * pricing.output * output_factor
+                    + (cc - cc_1h) as f64 * pricing.cache_create * input_factor
+                    + cc_1h as f64 * pricing.input * 2.0 * input_factor
+                    + cr as f64 * pricing.cache_read * input_factor)
                 / 1_000_000.0
         }
         None => 0.0,
@@ -432,14 +506,14 @@ pub fn get_record_cost(record: &RawRecord) -> f64 {
         // ISO-8601, so the leading 10 chars are the `YYYY-MM-DD` date; a
         // malformed timestamp falls back to the latest rates.
         let date = record.timestamp.get(..10).unwrap_or(LATEST_RATES);
-        get_cost_on(
-            &record.model,
-            date,
-            record.input,
-            record.output,
-            record.cache_create,
-            record.cache_read,
-        )
+        let tokens = Tokens {
+            input: record.input,
+            output: record.output,
+            cache_create: record.cache_create,
+            cache_create_1h: record.cache_create_1h.min(record.cache_create),
+            cache_read: record.cache_read,
+        };
+        cost_on(&record.model, date, record.fast, &tokens)
     })
 }
 
@@ -662,6 +736,7 @@ pub fn iter_file_records(path: &PathBuf) -> impl Iterator<Item = RawRecord> {
 fn parse_lines(lines: Vec<String>, source_id: &str) -> Vec<RawRecord> {
     let mut codex_model = "unknown".to_string();
     let mut codex_provider = "openai".to_string();
+    let mut codex_fast = false;
     let mut pi_session = false;
     let mut records = Vec::new();
 
@@ -691,6 +766,12 @@ fn parse_lines(lines: Vec<String>, source_id: &str) -> Vec<RawRecord> {
                 output: usage.output_tokens.unwrap_or(0),
                 cache_create: usage.cache_creation_input_tokens.unwrap_or(0),
                 cache_read: usage.cache_read_input_tokens.unwrap_or(0),
+                cache_create_1h: usage
+                    .cache_creation
+                    .as_ref()
+                    .and_then(|c| c.ephemeral_1h_input_tokens)
+                    .unwrap_or(0),
+                fast: usage.speed.as_deref() == Some("fast"),
             });
             continue;
         }
@@ -709,6 +790,11 @@ fn parse_lines(lines: Vec<String>, source_id: &str) -> Vec<RawRecord> {
                 if let Some(model) = payload.model.as_ref() {
                     codex_model.clone_from(model);
                 }
+                continue;
+            }
+            if let Some(settings) = payload.thread_settings.as_ref() {
+                // "priority" is the API's pre-rename name for fast mode.
+                codex_fast = matches!(settings.service_tier.as_deref(), Some("fast" | "priority"));
                 continue;
             }
             if jl.kind != "event_msg" || payload.kind.as_deref() != Some("token_count") {
@@ -734,6 +820,8 @@ fn parse_lines(lines: Vec<String>, source_id: &str) -> Vec<RawRecord> {
                 output: usage.output_tokens.unwrap_or(0),
                 cache_create: 0,
                 cache_read: cached,
+                cache_create_1h: 0,
+                fast: codex_fast,
             });
             continue;
         }
@@ -820,6 +908,8 @@ fn pi_usage_record(
         output,
         cache_create,
         cache_read,
+        cache_create_1h: 0,
+        fast: false,
     }
 }
 
@@ -975,6 +1065,8 @@ fn parse_opencode_message(
             .saturating_add(tokens.reasoning.unwrap_or(0)),
         cache_create: cache.write.unwrap_or(0),
         cache_read: cache.read.unwrap_or(0),
+        cache_create_1h: 0,
+        fast: false,
     })
 }
 
@@ -1083,6 +1175,9 @@ mod tests {
 
     #[test]
     fn prices_current_and_legacy_openai_models() {
+        assert_close(get_cost("gpt-6-astra", 100_000, 100_000, 0, 0), 6.00);
+        assert_close(get_cost("gpt-6-sol", 100_000, 100_000, 0, 0), 1.20);
+        assert_close(get_cost("gpt-6-luna", 100_000, 100_000, 0, 0), 0.06);
         assert_close(get_cost("gpt-5.6-sol", 100_000, 100_000, 0, 0), 2.40);
         assert_close(get_cost("gpt-5.6-cyber", 100_000, 100_000, 0, 0), 8.75);
         assert_close(get_cost("gpt-5.3-codex", 1_000_000, 1_000_000, 0, 0), 15.75);
@@ -1093,7 +1188,10 @@ mod tests {
     #[test]
     fn prices_cached_input_and_long_context() {
         assert_close(get_cost("gpt-5.6", 0, 0, 1_000_000, 1_000_000), 10.80);
+        assert_close(get_cost("gpt-6-astra", 0, 0, 100_000, 100_000), 1.35);
         // More than 272K total input applies 2x input/cache and 1.5x output.
+        assert_close(get_cost("gpt-6-astra", 272_001, 10_000, 0, 0), 6.19002);
+        assert_close(get_cost("gpt-6-sol", 272_001, 10_000, 0, 0), 1.238004);
         assert_close(get_cost("gpt-5.6-terra", 272_001, 10_000, 0, 0), 1.268004);
         // Cyber has no long-context tier.
         assert_close(get_cost("gpt-5.6-cyber", 272_001, 10_000, 0, 0), 4.1500125);
@@ -1126,8 +1224,8 @@ mod tests {
 
     #[test]
     fn prices_bare_tier_aliases_at_current_tier_rates() {
-        assert_close(get_cost("opus", 1_000_000, 0, 0, 0), 5.00);
-        assert_close(get_cost("sonnet", 1_000_000, 0, 0, 0), 3.00);
+        assert_close(get_cost("opus", 1_000_000, 0, 0, 0), 4.00);
+        assert_close(get_cost("sonnet", 1_000_000, 0, 0, 0), 2.00);
         assert_close(get_cost("haiku", 1_000_000, 0, 0, 0), 1.00);
         assert_close(get_cost("fable", 1_000_000, 0, 0, 0), 10.00);
         assert_close(get_cost("fable", 0, 0, 0, 1_000_000), 0.25);
@@ -1216,6 +1314,8 @@ mod tests {
             output: 0,
             cache_create: 0,
             cache_read: 0,
+            cache_create_1h: 0,
+            fast: false,
         };
 
         // A record from before the price cut keeps billing at the old rate
@@ -1234,6 +1334,16 @@ mod tests {
     #[test]
     fn prices_claude_5_family_and_retired_sonnet() {
         assert_close(get_cost("claude-opus-5", 1_000_000, 1_000_000, 0, 0), 30.00);
+        // Opus 5.5 must not fall through to the shorter Opus 5 prefix; its
+        // cache reads are 5% of input.
+        assert_close(
+            get_cost("claude-opus-5-5", 1_000_000, 1_000_000, 0, 0),
+            24.00,
+        );
+        assert_close(
+            get_cost("claude-opus-5-5", 0, 0, 1_000_000, 1_000_000),
+            5.20,
+        );
         assert_close(
             get_cost("claude-sonnet-5", 1_000_000, 1_000_000, 0, 0),
             12.00,
@@ -1263,6 +1373,75 @@ mod tests {
         // Gemini Flash bills flat at any size.
         assert_close(get_cost("gemini-3.5-flash", 1_000_000, 0, 0, 0), 1.50);
         assert_close(get_cost("gemini-3.8-flash", 1_000_000, 0, 0, 0), 1.50);
+    }
+
+    fn fast_cost(model: &str, inp: u64, out: u64, cc: u64, cr: u64) -> f64 {
+        let tokens = Tokens {
+            input: inp,
+            output: out,
+            cache_create: cc,
+            cache_create_1h: 0,
+            cache_read: cr,
+        };
+        cost_on(model, LATEST_RATES, true, &tokens)
+    }
+
+    #[test]
+    fn prices_fast_mode_at_each_model_multiplier() {
+        // Opus 5.5 fast is $8 / $40; caching multipliers stack on top.
+        assert_close(
+            fast_cost("claude-opus-5-5", 1_000_000, 1_000_000, 0, 0),
+            48.00,
+        );
+        assert_close(
+            fast_cost("claude-opus-5-5", 0, 0, 1_000_000, 1_000_000),
+            10.40,
+        );
+        assert_close(
+            fast_cost("claude-opus-4-8", 1_000_000, 1_000_000, 0, 0),
+            60.00,
+        );
+        // GPT-5.5 fast is 2.5x, GPT-6 is 2x and composes with long context.
+        assert_close(fast_cost("gpt-5.5", 100_000, 100_000, 0, 0), 8.75);
+        assert_close(fast_cost("gpt-6-sol", 272_001, 10_000, 0, 0), 2.476008);
+        // Models without fast mode bill at standard rates, as Opus 4.6 does.
+        assert_close(fast_cost("claude-opus-4-6", 1_000_000, 0, 0, 0), 5.00);
+        assert_close(fast_cost("gpt-5.3-codex", 1_000_000, 0, 0, 0), 1.75);
+    }
+
+    #[test]
+    fn bills_one_hour_cache_writes_at_twice_input() {
+        let lines = vec![
+            r#"{"type":"assistant","timestamp":"2026-09-20T10:00:00Z","requestId":"a","message":{"id":"a","model":"claude-opus-5-5","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":1000000,"cache_creation":{"ephemeral_5m_input_tokens":400000,"ephemeral_1h_input_tokens":600000}}}}"#.to_string(),
+        ];
+
+        let records = parse_lines(lines, "claude-session.jsonl");
+        // 1h writes stay inside the cache-write total for token reporting.
+        assert_eq!(
+            (records[0].cache_create, records[0].cache_create_1h),
+            (1_000_000, 600_000)
+        );
+        // 400K at the 5m rate ($5) plus 600K at 2x input ($8).
+        assert_close(get_record_cost(&records[0]), 6.80);
+    }
+
+    #[test]
+    fn detects_fast_mode_in_claude_and_codex_logs() {
+        let lines = vec![
+            r#"{"type":"assistant","timestamp":"2026-09-20T10:00:00Z","requestId":"a","message":{"id":"a","model":"claude-opus-5-5","usage":{"input_tokens":10,"output_tokens":2,"speed":"fast"}}}"#.to_string(),
+            r#"{"type":"assistant","timestamp":"2026-09-20T10:00:01Z","requestId":"b","message":{"id":"b","model":"claude-opus-5-5","usage":{"input_tokens":10,"output_tokens":2,"speed":"standard"}}}"#.to_string(),
+            r#"{"type":"turn_context","timestamp":"2026-09-20T10:00:02Z","payload":{"model":"gpt-6-sol"}}"#.to_string(),
+            r#"{"type":"event_msg","timestamp":"2026-09-20T10:00:03Z","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-6-sol","service_tier":"fast"}}}"#.to_string(),
+            r#"{"type":"event_msg","timestamp":"2026-09-20T10:00:04Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":7}}}}"#.to_string(),
+            r#"{"type":"event_msg","timestamp":"2026-09-20T10:00:05Z","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-6-sol","service_tier":"default"}}}"#.to_string(),
+            r#"{"type":"event_msg","timestamp":"2026-09-20T10:00:06Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":7}}}}"#.to_string(),
+        ];
+
+        let records = parse_lines(lines, "session.jsonl");
+        let fast: Vec<bool> = records.iter().map(|r| r.fast).collect();
+        assert_eq!(fast, [true, false, true, false]);
+        // The flag reaches the cost: 10 in + 2 out at $8 / $40.
+        assert_close(get_record_cost(&records[0]), 0.00016);
     }
 
     #[test]

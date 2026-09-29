@@ -257,6 +257,8 @@ macro_rules! price {
 }
 
 static PRICING: &[ModelPricing] = &[
+    // OpenAI GPT-6.1 Sol — cache reads are 5% of input ($0.10), not 10%.
+    price!("gpt-6.1-sol", 2.00, 10.00, 2.50, 0.10, long).fast(2.0),
     // OpenAI GPT-6 — cache writes are 1.25x uncached input, as on GPT-5.6.
     price!("gpt-6-astra", 10.00, 50.00, 12.50, 1.00, long).fast(2.0),
     price!("gpt-6-sol", 2.00, 10.00, 2.50, 0.20, long).fast(2.0),
@@ -290,17 +292,20 @@ static PRICING: &[ModelPricing] = &[
     price!("gpt-5.4-pro", 30.00, 180.00, 30.00, 30.00, long),
     price!("gpt-5.4", 2.50, 15.00, 2.50, 0.25, long).fast(2.0),
     // Legacy Codex model families.
-    price!("gpt-5.3-codex", 1.75, 14.00, 1.75, 0.175),
+    price!("gpt-5.3-codex", 1.75, 14.00, 1.75, 0.175).fast(2.0),
     price!("gpt-5.2-codex", 1.75, 14.00, 1.75, 0.175),
-    price!("gpt-5.2", 1.75, 14.00, 1.75, 0.175),
+    price!("gpt-5.2-pro", 21.00, 168.00, 21.00, 21.00),
+    price!("gpt-5.2", 1.75, 14.00, 1.75, 0.175).fast(2.0),
     price!("gpt-5.1-codex-mini", 0.25, 2.00, 0.25, 0.025),
     price!("gpt-5.1-codex-max", 1.25, 10.00, 1.25, 0.125),
     price!("gpt-5.1-codex", 1.25, 10.00, 1.25, 0.125),
-    price!("gpt-5.1", 1.25, 10.00, 1.25, 0.125),
+    price!("gpt-5.1", 1.25, 10.00, 1.25, 0.125).fast(2.0),
     price!("gpt-5-codex", 1.25, 10.00, 1.25, 0.125),
-    price!("gpt-5-mini", 0.25, 2.00, 0.25, 0.025),
+    // GPT-5 mini fast mode is $0.45 / $3.60, 1.8x rather than the usual 2x.
+    price!("gpt-5-mini", 0.25, 2.00, 0.25, 0.025).fast(1.8),
     price!("gpt-5-nano", 0.05, 0.40, 0.05, 0.005),
-    price!("gpt-5", 1.25, 10.00, 1.25, 0.125),
+    price!("gpt-5-pro", 15.00, 120.00, 15.00, 15.00),
+    price!("gpt-5", 1.25, 10.00, 1.25, 0.125).fast(2.0),
     price!("codex-mini-latest", 1.50, 6.00, 1.50, 0.375),
     price!("o4-mini", 1.10, 4.40, 1.10, 0.275),
     price!("o3", 2.00, 8.00, 2.00, 0.50),
@@ -360,6 +365,9 @@ static PRICING: &[ModelPricing] = &[
     price!("claude-opus-5-5", 4.00, 20.00, 5.00, 0.20).fast(2.0),
     // Opus 5 — $5 / $25 per MTok
     price!("claude-opus-5", 5.00, 25.00, 6.25, 0.50).fast(2.0),
+    // Sonnet 5.5 — $2 / $10 per MTok, same as Sonnet 5. Listed before the
+    // Sonnet 5 prefix so it stays correct if the two prices diverge.
+    price!("claude-sonnet-5-5", 2.00, 10.00, 2.50, 0.20),
     // Sonnet 5 — $2 / $10 per MTok. Launched as an introductory rate through
     // 2026-08-31; Anthropic later made it the standard price and cancelled
     // the planned $3 / $15 step, so there is no dated window.
@@ -1349,6 +1357,10 @@ mod tests {
             12.00,
         );
         assert_close(
+            get_cost("claude-sonnet-5-5", 1_000_000, 1_000_000, 0, 0),
+            12.00,
+        );
+        assert_close(
             get_cost("claude-fable-5-1", 1_000_000, 1_000_000, 0, 0),
             60.00,
         );
@@ -1404,9 +1416,20 @@ mod tests {
         // GPT-5.5 fast is 2.5x, GPT-6 is 2x and composes with long context.
         assert_close(fast_cost("gpt-5.5", 100_000, 100_000, 0, 0), 8.75);
         assert_close(fast_cost("gpt-6-sol", 272_001, 10_000, 0, 0), 2.476008);
+        // GPT-6.1 Sol fast doubles its 5% cache-read rate too.
+        assert_close(fast_cost("gpt-6.1-sol", 0, 0, 0, 100_000), 0.02);
+        // Older GPT-5 models gained fast mode: 2x, except GPT-5 mini at 1.8x.
+        assert_close(fast_cost("gpt-5.3-codex", 1_000_000, 0, 0, 0), 3.50);
+        assert_close(fast_cost("gpt-5-mini", 1_000_000, 1_000_000, 0, 0), 4.05);
         // Models without fast mode bill at standard rates, as Opus 4.6 does.
         assert_close(fast_cost("claude-opus-4-6", 1_000_000, 0, 0, 0), 5.00);
-        assert_close(fast_cost("gpt-5.3-codex", 1_000_000, 0, 0, 0), 1.75);
+        assert_close(fast_cost("gpt-5.4-nano", 1_000_000, 0, 0, 0), 0.20);
+    }
+
+    #[test]
+    fn prices_gpt_5_pro_models_apart_from_their_base_prefix() {
+        assert_close(get_cost("gpt-5.2-pro", 1_000_000, 1_000_000, 0, 0), 189.00);
+        assert_close(get_cost("gpt-5-pro", 1_000_000, 1_000_000, 0, 0), 135.00);
     }
 
     #[test]

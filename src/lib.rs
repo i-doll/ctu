@@ -151,10 +151,12 @@ struct OpenCodeTime {
 // ── Pricing table ────────────────────────────────────────────────────────────
 
 // Standard processing prices in USD per million tokens. More-specific model
-// prefixes must precede their families. `long_context` is `(threshold, output
-// multiplier)`: above `threshold` input tokens the whole request bills at 2x
-// input/cache and the given output multiplier. OpenAI charges 1.5x output over
-// 272K and Gemini Pro the same over 200K; xAI doubles every rate over 200K.
+// prefixes must precede their families. `long_context` is `(threshold, input
+// multiplier, output multiplier)`: above `threshold` input tokens the whole
+// request bills at the input multiplier on input/cache and the output
+// multiplier on output. OpenAI charges 2x input and 1.5x output over 272K and
+// Gemini Pro the same over 200K; xAI doubles every rate over 200K; Haiku 5.5
+// quintuples every rate over 100K.
 // Providers whose cache writes carry no separate charge (OpenAI, Google, xAI,
 // Moonshot) set `cache_create` equal to `input` — those tokens bill as
 // ordinary input.
@@ -178,7 +180,7 @@ struct ModelPricing {
     output: f64,
     cache_create: f64,
     cache_read: f64,
-    long_context: Option<(u64, f64)>,
+    long_context: Option<(u64, f64, f64)>,
     /// Inclusive lower bound, `YYYY-MM-DD`. `None` = no lower bound.
     from: Option<&'static str>,
     /// Exclusive upper bound, `YYYY-MM-DD`. `None` = no upper bound.
@@ -242,13 +244,16 @@ macro_rules! price {
         price!($prefix, $input, $output, $cache_create, $cache_read, long 272_000, 1.5)
     };
     ($prefix:expr, $input:expr, $output:expr, $cache_create:expr, $cache_read:expr, long $threshold:expr, $output_factor:expr) => {
+        price!($prefix, $input, $output, $cache_create, $cache_read, long $threshold, 2.0, $output_factor)
+    };
+    ($prefix:expr, $input:expr, $output:expr, $cache_create:expr, $cache_read:expr, long $threshold:expr, $input_factor:expr, $output_factor:expr) => {
         ModelPricing {
             prefix: $prefix,
             input: $input,
             output: $output,
             cache_create: $cache_create,
             cache_read: $cache_read,
-            long_context: Some(($threshold, $output_factor)),
+            long_context: Some(($threshold, $input_factor, $output_factor)),
             from: None,
             until: None,
             fast: None,
@@ -257,8 +262,9 @@ macro_rules! price {
 }
 
 static PRICING: &[ModelPricing] = &[
-    // OpenAI GPT-6.1 Sol — cache reads are 5% of input ($0.10), not 10%.
+    // OpenAI GPT-6.1 — cache reads are 5% of input, not 10%.
     price!("gpt-6.1-sol", 2.00, 10.00, 2.50, 0.10, long).fast(2.0),
+    price!("gpt-6.1-terra", 1.00, 5.00, 1.25, 0.05, long).fast(2.0),
     // OpenAI GPT-6 — cache writes are 1.25x uncached input, as on GPT-5.6.
     price!("gpt-6-astra", 10.00, 50.00, 12.50, 1.00, long).fast(2.0),
     price!("gpt-6-sol", 2.00, 10.00, 2.50, 0.20, long).fast(2.0),
@@ -324,6 +330,9 @@ static PRICING: &[ModelPricing] = &[
     // Only Pro carries a long-context surcharge (>200K), Flash bills flat.
     // Flash 3.6 through 3.8 are $0.75 / $3.75 through 2026-12-31 and
     // $1.50 / $7.50 from 2027-01-01.
+    // Gemini 4 Argon doubles every rate from 2026-12-01.
+    price!("gemini-4-argon", 2.00, 10.00, 2.00, 0.10).until("2026-12-01"),
+    price!("gemini-4-argon", 4.00, 20.00, 4.00, 0.20).from("2026-12-01"),
     price!("gemini-3.8-flash", 0.75, 3.75, 0.75, 0.075).until("2027-01-01"),
     price!("gemini-3.8-flash", 1.50, 7.50, 1.50, 0.15).from("2027-01-01"),
     price!("gemini-3.7-flash", 0.75, 3.75, 0.75, 0.075).until("2027-01-01"),
@@ -338,6 +347,7 @@ static PRICING: &[ModelPricing] = &[
     // The proxy's "gemini-pro-agent" alias tracks the current Pro tier.
     price!("gemini-pro", 2.00, 12.00, 2.00, 0.20, long 200_000, 1.5),
     // xAI Grok — every rate doubles above 200K input tokens.
+    price!("grok-4.7", 2.00, 6.00, 2.00, 0.50, long 200_000, 2.0),
     price!("grok-4.6", 2.00, 6.00, 2.00, 0.50, long 200_000, 2.0),
     price!("grok-4.5", 2.00, 6.00, 2.00, 0.30, long 200_000, 2.0),
     price!("grok-4.3", 1.25, 2.50, 1.25, 0.20, long 200_000, 2.0),
@@ -346,6 +356,9 @@ static PRICING: &[ModelPricing] = &[
     price!("grok-composer-2.5", 1.25, 2.50, 1.25, 0.20, long 200_000, 2.0),
     price!("grok-3-mini", 0.30, 0.50, 0.30, 0.075),
     // Moonshot Kimi — cache hits are ~10% of input; no long-context surcharge.
+    // K3.1 Pro highspeed doubles every rate except cache hits.
+    price!("kimi-k3.1-pro-highspeed", 4.00, 20.00, 4.00, 0.20),
+    price!("kimi-k3.1-pro", 2.00, 10.00, 2.00, 0.20),
     price!("kimi-k3", 3.00, 15.00, 3.00, 0.30),
     price!("kimi-k2.7-code-highspeed", 1.90, 8.00, 1.90, 0.38),
     price!("kimi-k2.7-code", 0.95, 4.00, 0.95, 0.19),
@@ -365,9 +378,9 @@ static PRICING: &[ModelPricing] = &[
     price!("claude-opus-5-5", 4.00, 20.00, 5.00, 0.20).fast(2.0),
     // Opus 5 — $5 / $25 per MTok
     price!("claude-opus-5", 5.00, 25.00, 6.25, 0.50).fast(2.0),
-    // Sonnet 5.5 — $2 / $10 per MTok, same as Sonnet 5. Listed before the
-    // Sonnet 5 prefix so it stays correct if the two prices diverge.
-    price!("claude-sonnet-5-5", 2.00, 10.00, 2.50, 0.20),
+    // Sonnet 5.5 — $2 / $10 per MTok; cache reads are 5% of input ($0.10).
+    // Must precede the Sonnet 5 prefix.
+    price!("claude-sonnet-5-5", 2.00, 10.00, 2.50, 0.10),
     // Sonnet 5 — $2 / $10 per MTok. Launched as an introductory rate through
     // 2026-08-31; Anthropic later made it the standard price and cancelled
     // the planned $3 / $15 step, so there is no dated window.
@@ -384,6 +397,9 @@ static PRICING: &[ModelPricing] = &[
     price!("claude-sonnet-4-6", 3.00, 15.00, 3.75, 0.30),
     price!("claude-sonnet-4-5", 3.00, 15.00, 3.75, 0.30),
     price!("claude-sonnet-4-20250514", 3.00, 15.00, 3.75, 0.30),
+    // Haiku 5.5 — $0.10 / $0.50 per MTok; every rate is 5x for prompts over
+    // 100K tokens.
+    price!("claude-haiku-5-5", 0.10, 0.50, 0.125, 0.01, long 100_000, 5.0, 5.0),
     // Haiku 4.5 — $1 / $5 per MTok
     price!("claude-haiku-4-5", 1.00, 5.00, 1.25, 0.10),
     // Haiku 3.5 — $0.80 / $4 per MTok (retired on the first-party API)
@@ -491,9 +507,9 @@ fn cost_on(model: &str, date: &str, fast: bool, tokens: &Tokens) -> f64 {
             let input_tokens = inp.saturating_add(cc).saturating_add(cr);
             let long = pricing
                 .long_context
-                .filter(|(threshold, _)| input_tokens > *threshold);
-            let input_factor = if long.is_some() { 2.0 } else { 1.0 };
-            let output_factor = long.map_or(1.0, |(_, factor)| factor);
+                .filter(|(threshold, _, _)| input_tokens > *threshold);
+            let input_factor = long.map_or(1.0, |(_, factor, _)| factor);
+            let output_factor = long.map_or(1.0, |(_, _, factor)| factor);
             let speed_factor = pricing.fast.filter(|_| fast).unwrap_or(1.0);
             speed_factor
                 * (inp as f64 * pricing.input * input_factor
@@ -1200,6 +1216,7 @@ mod tests {
         // More than 272K total input applies 2x input/cache and 1.5x output.
         assert_close(get_cost("gpt-6-astra", 272_001, 10_000, 0, 0), 6.19002);
         assert_close(get_cost("gpt-6-sol", 272_001, 10_000, 0, 0), 1.238004);
+        assert_close(get_cost("gpt-6.1-terra", 272_001, 10_000, 0, 0), 0.619002);
         assert_close(get_cost("gpt-5.6-terra", 272_001, 10_000, 0, 0), 1.268004);
         // Cyber has no long-context tier.
         assert_close(get_cost("gpt-5.6-cyber", 272_001, 10_000, 0, 0), 4.1500125);
@@ -1222,6 +1239,26 @@ mod tests {
         assert_close(get_cost("grok-4.6", 0, 0, 0, 100_000), 0.05);
         assert_close(get_cost("grok-4.5-build-free", 100_000, 0, 0, 0), 0.20);
         assert_close(get_cost("kimi-k3", 1_000_000, 1_000_000, 0, 0), 18.00);
+        assert_close(get_cost("kimi-k3.1-pro", 1_000_000, 1_000_000, 0, 0), 12.00);
+        assert_close(
+            get_cost(
+                "kimi-k3.1-pro-highspeed",
+                1_000_000,
+                1_000_000,
+                0,
+                1_000_000,
+            ),
+            24.20,
+        );
+        assert_close(get_cost("grok-4.7", 0, 0, 0, 100_000), 0.05);
+        assert_close(
+            get_cost_on("gemini-4-argon", "2026-11-30", 1_000_000, 1_000_000, 0, 0),
+            12.00,
+        );
+        assert_close(
+            get_cost_on("gemini-4-argon", "2026-12-01", 1_000_000, 1_000_000, 0, 0),
+            24.00,
+        );
         assert_close(get_cost("kimi-k2.6", 1_000_000, 1_000_000, 0, 0), 4.95);
         assert_close(get_cost("kimi-k2.6", 0, 0, 0, 1_000_000), 0.16);
         assert_close(
@@ -1382,6 +1419,12 @@ mod tests {
         assert_close(get_cost("gemini-3.1-pro", 200_000, 0, 0, 0), 0.400000);
         // xAI doubles output too, rather than applying OpenAI's 1.5x.
         assert_close(get_cost("grok-4.5", 200_001, 100_000, 0, 0), 2.000004);
+        // Haiku 5.5 quintuples every rate above 100K, cache reads included.
+        assert_close(get_cost("claude-haiku-5-5", 100_000, 100_000, 0, 0), 0.06);
+        assert_close(
+            get_cost("claude-haiku-5-5", 0, 100_000, 0, 100_001),
+            0.25500005,
+        );
         // Gemini Flash bills flat at any size.
         assert_close(get_cost("gemini-3.5-flash", 1_000_000, 0, 0, 0), 1.50);
         assert_close(get_cost("gemini-3.8-flash", 1_000_000, 0, 0, 0), 1.50);

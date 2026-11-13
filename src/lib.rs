@@ -267,11 +267,12 @@ static PRICING: &[ModelPricing] = &[
     price!("gpt-6.1-terra", 1.00, 5.00, 1.25, 0.05, long).fast(2.0),
     // OpenAI GPT-6 — cache writes are 1.25x uncached input, as on GPT-5.6.
     price!("gpt-6-astra", 10.00, 50.00, 12.50, 1.00, long).fast(2.0),
+    price!("gpt-6-cyber", 20.00, 100.00, 25.00, 2.00, long),
     price!("gpt-6-sol", 2.00, 10.00, 2.50, 0.20, long).fast(2.0),
     price!("gpt-6-luna", 0.10, 0.50, 0.125, 0.01, long).fast(2.0),
     // OpenAI GPT-5.6 — cache writes are 1.25x uncached input. Terra and Luna
     // were cut on 2026-07-30 and Sol on 2026-08-21; the Sol rate is billed as
-    // promotional "at least through 2026-11-21" with no later price announced,
+    // promotional until 2026-11-30 with no later price announced,
     // so its window stays open-ended.
     price!("gpt-5.6-terra", 2.50, 15.00, 3.125, 0.25, long).until("2026-07-30"),
     price!("gpt-5.6-terra", 2.00, 12.00, 2.50, 0.20, long)
@@ -314,13 +315,15 @@ static PRICING: &[ModelPricing] = &[
     price!("gpt-5", 1.25, 10.00, 1.25, 0.125).fast(2.0),
     price!("codex-mini-latest", 1.50, 6.00, 1.50, 0.375),
     price!("o4-mini", 1.10, 4.40, 1.10, 0.275),
-    price!("o3", 2.00, 8.00, 2.00, 0.50),
+    price!("o3-pro", 20.00, 80.00, 20.00, 20.00),
+    // o3 and GPT-4.1 fast mode is 1.75x; GPT-4o is 1.7x.
+    price!("o3", 2.00, 8.00, 2.00, 0.50).fast(1.75),
     price!("gpt-4.1-mini", 0.40, 1.60, 0.40, 0.10),
     price!("gpt-4.1-nano", 0.10, 0.40, 0.10, 0.025),
-    price!("gpt-4.1", 2.00, 8.00, 2.00, 0.50),
+    price!("gpt-4.1", 2.00, 8.00, 2.00, 0.50).fast(1.75),
     price!("gpt-4o-2024-05-13", 5.00, 15.00, 5.00, 5.00),
     price!("gpt-4o-mini", 0.15, 0.60, 0.15, 0.075),
-    price!("gpt-4o", 2.50, 10.00, 2.50, 1.25),
+    price!("gpt-4o", 2.50, 10.00, 2.50, 1.25).fast(1.7),
     // Open-weight; the rate depends entirely on who hosts it (roughly
     // $0.04-$0.15 in / $0.15-$0.75 out per MTok). Priced at the mid-range
     // OpenRouter rate rather than left unpriced.
@@ -330,9 +333,12 @@ static PRICING: &[ModelPricing] = &[
     // Only Pro carries a long-context surcharge (>200K), Flash bills flat.
     // Flash 3.6 through 3.8 are $0.75 / $3.75 through 2026-12-31 and
     // $1.50 / $7.50 from 2027-01-01.
-    // Gemini 4 Argon doubles every rate from 2026-12-01.
+    // Gemini 4 Carbon and Argon double every rate from 2026-12-01.
+    price!("gemini-4-carbon", 2.00, 10.00, 2.00, 0.10).until("2026-12-01"),
+    price!("gemini-4-carbon", 4.00, 20.00, 4.00, 0.20).from("2026-12-01"),
     price!("gemini-4-argon", 2.00, 10.00, 2.00, 0.10).until("2026-12-01"),
     price!("gemini-4-argon", 4.00, 20.00, 4.00, 0.20).from("2026-12-01"),
+    price!("gemini-4-hydrogen", 1.50, 7.50, 1.50, 0.075),
     price!("gemini-3.8-flash", 0.75, 3.75, 0.75, 0.075).until("2027-01-01"),
     price!("gemini-3.8-flash", 1.50, 7.50, 1.50, 0.15).from("2027-01-01"),
     price!("gemini-3.7-flash", 0.75, 3.75, 0.75, 0.075).until("2027-01-01"),
@@ -366,6 +372,10 @@ static PRICING: &[ModelPricing] = &[
     price!("kimi-k2.5", 0.60, 3.00, 0.60, 0.19),
     price!("kimi-k2-thinking", 0.60, 2.50, 0.60, 0.15),
     price!("kimi-k2", 0.55, 2.20, 0.55, 0.15),
+    // Fable 5.2 / Mythos 5.2 — $8 / $40 per MTok; cache reads are 2.5% of
+    // input ($0.20). Must precede the Fable 5 prefix.
+    price!("claude-fable-5-2", 8.00, 40.00, 10.00, 0.20).fast(2.0),
+    price!("claude-mythos-5-2", 8.00, 40.00, 10.00, 0.20).fast(2.0),
     // Fable 5.1 / Mythos 5.1 — $10 / $50 per MTok; cache reads are 2.5% of
     // input ($0.25) rather than the usual 10%. Must precede the Fable 5 prefix.
     price!("claude-fable-5-1", 10.00, 50.00, 12.50, 0.25),
@@ -412,10 +422,10 @@ static PRICING: &[ModelPricing] = &[
     // than as $0. Keep last: these prefixes are short and would otherwise
     // shadow the specific ids above.
     price!("gemini-default", 1.50, 9.00, 1.50, 0.15),
-    price!("fable", 10.00, 50.00, 12.50, 0.25),
+    price!("fable", 8.00, 40.00, 10.00, 0.20).fast(2.0),
     price!("opus", 4.00, 20.00, 5.00, 0.20).fast(2.0),
-    price!("sonnet", 2.00, 10.00, 2.50, 0.20),
-    price!("haiku", 1.00, 5.00, 1.25, 0.10),
+    price!("sonnet", 2.00, 10.00, 2.50, 0.10),
+    price!("haiku", 0.10, 0.50, 0.125, 0.01, long 100_000, 5.0, 5.0),
 ];
 
 // ── Public functions ─────────────────────────────────────────────────────────
@@ -1259,6 +1269,20 @@ mod tests {
             get_cost_on("gemini-4-argon", "2026-12-01", 1_000_000, 1_000_000, 0, 0),
             24.00,
         );
+        assert_close(
+            get_cost_on("gemini-4-carbon", "2026-11-30", 1_000_000, 1_000_000, 0, 0),
+            12.00,
+        );
+        assert_close(
+            get_cost_on("gemini-4-carbon", "2026-12-01", 0, 0, 0, 1_000_000),
+            0.20,
+        );
+        assert_close(
+            get_cost("gemini-4-hydrogen", 1_000_000, 1_000_000, 0, 1_000_000),
+            9.075,
+        );
+        assert_close(get_cost("gpt-6-cyber", 100_000, 100_000, 0, 0), 12.00);
+        assert_close(get_cost("o3-pro", 1_000_000, 1_000_000, 0, 0), 100.00);
         assert_close(get_cost("kimi-k2.6", 1_000_000, 1_000_000, 0, 0), 4.95);
         assert_close(get_cost("kimi-k2.6", 0, 0, 0, 1_000_000), 0.16);
         assert_close(
@@ -1271,9 +1295,11 @@ mod tests {
     fn prices_bare_tier_aliases_at_current_tier_rates() {
         assert_close(get_cost("opus", 1_000_000, 0, 0, 0), 4.00);
         assert_close(get_cost("sonnet", 1_000_000, 0, 0, 0), 2.00);
-        assert_close(get_cost("haiku", 1_000_000, 0, 0, 0), 1.00);
-        assert_close(get_cost("fable", 1_000_000, 0, 0, 0), 10.00);
-        assert_close(get_cost("fable", 0, 0, 0, 1_000_000), 0.25);
+        assert_close(get_cost("sonnet", 0, 0, 0, 1_000_000), 0.10);
+        assert_close(get_cost("haiku", 100_000, 0, 0, 0), 0.01);
+        assert_close(get_cost("haiku", 100_001, 0, 0, 0), 0.0500005);
+        assert_close(get_cost("fable", 1_000_000, 0, 0, 0), 8.00);
+        assert_close(get_cost("fable", 0, 0, 0, 1_000_000), 0.20);
         assert_close(get_cost("gemini-default", 1_000_000, 0, 0, 0), 1.50);
         // The aliases must not shadow fully-qualified ids that share a prefix.
         assert_close(get_cost("claude-opus-4-1", 1_000_000, 0, 0, 0), 15.00);
@@ -1403,6 +1429,14 @@ mod tests {
         );
         // Fable/Mythos 5.1 cache reads are 2.5% of input; Fable 5 stays at 10%.
         assert_close(get_cost("claude-fable-5-1", 0, 0, 0, 1_000_000), 0.25);
+        assert_close(
+            get_cost("claude-fable-5-2", 1_000_000, 1_000_000, 0, 0),
+            48.00,
+        );
+        assert_close(
+            get_cost("claude-mythos-5-2", 0, 0, 1_000_000, 1_000_000),
+            10.20,
+        );
         assert_close(get_cost("claude-mythos-5-1", 0, 0, 0, 1_000_000), 0.25);
         assert_close(get_cost("claude-fable-5", 0, 0, 0, 1_000_000), 1.00);
         assert_close(get_cost("claude-mythos-5", 0, 0, 0, 1_000_000), 1.00);
@@ -1464,6 +1498,15 @@ mod tests {
         // Older GPT-5 models gained fast mode: 2x, except GPT-5 mini at 1.8x.
         assert_close(fast_cost("gpt-5.3-codex", 1_000_000, 0, 0, 0), 3.50);
         assert_close(fast_cost("gpt-5-mini", 1_000_000, 1_000_000, 0, 0), 4.05);
+        // Fable 5.2 fast is $16 / $80.
+        assert_close(
+            fast_cost("claude-fable-5-2", 1_000_000, 1_000_000, 0, 0),
+            96.00,
+        );
+        // o3 and GPT-4.1 fast is 1.75x, GPT-4o 1.7x.
+        assert_close(fast_cost("o3", 1_000_000, 1_000_000, 0, 0), 17.50);
+        assert_close(fast_cost("gpt-4.1", 1_000_000, 1_000_000, 0, 0), 17.50);
+        assert_close(fast_cost("gpt-4o", 1_000_000, 1_000_000, 0, 0), 21.25);
         // Models without fast mode bill at standard rates, as Opus 4.6 does.
         assert_close(fast_cost("claude-opus-4-6", 1_000_000, 0, 0, 0), 5.00);
         assert_close(fast_cost("gpt-5.4-nano", 1_000_000, 0, 0, 0), 0.20);

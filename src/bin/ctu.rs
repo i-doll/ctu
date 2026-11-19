@@ -5,8 +5,8 @@ use clap::Parser;
 use serde_json::json;
 
 use ctu::{
-    find_jsonl_files, fmt_num, get_log_dirs, get_opencode_files, get_record_cost,
-    DeduplicatedRecords, PeriodAgg,
+    drop_files_modified_before, find_jsonl_files, fmt_num, get_log_dirs, get_opencode_files,
+    get_record_cost, DeduplicatedRecords, PeriodAgg,
 };
 
 #[derive(Parser)]
@@ -76,10 +76,13 @@ fn main() {
         std::process::exit(1);
     }
 
-    let files = find_jsonl_files(&dirs);
+    let mut files = find_jsonl_files(&dirs);
     if files.is_empty() && opencode_files.is_empty() {
         eprintln!("No usage records found.");
         std::process::exit(1);
+    }
+    if let Some(since) = cli.since.as_deref() {
+        drop_files_modified_before(&mut files, since);
     }
 
     eprintln!(

@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
@@ -736,6 +737,22 @@ pub fn find_jsonl_files(dirs: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
+/// Drops files last modified before `since` (YYYY-MM-DD, UTC). Every record in a
+/// file is written before the file's mtime, so none of them could pass the filter.
+pub fn drop_files_modified_before(files: &mut Vec<PathBuf>, since: &str) {
+    files.retain(|path| {
+        let Some(modified) = std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        else {
+            return true;
+        };
+        let date = timestamp_from_millis(modified.as_millis() as i64);
+        date[..10] >= *since
+    });
+}
+
 fn collect_jsonl(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
     let rd = match std::fs::read_dir(dir) {
         Ok(r) => r,
@@ -1150,6 +1167,37 @@ pub fn dedup_key(r: &RawRecord) -> Option<(String, String)> {
     }
 }
 
+/// Parses each file on a worker thread; results keep the input order so
+/// deduplication stays deterministic.
+fn parse_files_in_parallel(files: &[PathBuf]) -> Vec<Vec<RawRecord>> {
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let next = AtomicUsize::new(0);
+    let mut results: Vec<Vec<RawRecord>> = Vec::new();
+    results.resize_with(files.len(), Vec::new);
+    let parsed: Vec<Vec<(usize, Vec<RawRecord>)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers.min(files.len()))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut out = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(path) = files.get(index) else {
+                            break;
+                        };
+                        out.push((index, iter_file_records(path).collect()));
+                    }
+                    out
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for (index, file_records) in parsed.into_iter().flatten() {
+        results[index] = file_records;
+    }
+    results
+}
+
 pub struct DeduplicatedRecords {
     pub records: Vec<RawRecord>,
 }
@@ -1162,8 +1210,8 @@ impl DeduplicatedRecords {
     pub fn collect_with_opencode(jsonl_files: &[PathBuf], opencode_files: &[PathBuf]) -> Self {
         let mut seen: HashSet<(String, String)> = HashSet::new();
         let mut records = Vec::new();
-        for path in jsonl_files {
-            for rec in iter_file_records(path) {
+        for file_records in parse_files_in_parallel(jsonl_files) {
+            for rec in file_records {
                 if let Some(key) = dedup_key(&rec) {
                     if !seen.insert(key) {
                         continue;
@@ -1740,6 +1788,34 @@ mod tests {
         assert_eq!((record.input, record.output), (6, 105));
         assert_eq!((record.cache_create, record.cache_read), (20, 30));
         assert_close(get_record_cost(&record), 0.42);
+    }
+
+    #[test]
+    fn drops_only_files_last_modified_before_since() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ctu-mtime-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = dir.join("stale.jsonl");
+        let fresh = dir.join("fresh.jsonl");
+        let missing = dir.join("missing.jsonl");
+        let at = |millis: u64| std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis);
+        File::create(&stale)
+            .unwrap()
+            .set_modified(at(1_794_527_999_999)) // 2026-11-12T23:59:59.999Z
+            .unwrap();
+        File::create(&fresh)
+            .unwrap()
+            .set_modified(at(1_794_528_000_000)) // 2026-11-13T00:00:00.000Z
+            .unwrap();
+
+        let mut files = vec![stale, fresh.clone(), missing.clone()];
+        drop_files_modified_before(&mut files, "2026-11-13");
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(files, vec![fresh, missing]);
     }
 
     #[test]

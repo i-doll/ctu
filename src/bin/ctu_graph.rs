@@ -6,8 +6,8 @@ use is_terminal::IsTerminal;
 use terminal_size::{terminal_size, Width};
 
 use ctu::{
-    find_jsonl_files, fmt_cost, fmt_num, get_log_dirs, get_opencode_files, get_record_cost,
-    DeduplicatedRecords, PeriodAgg,
+    drop_files_modified_before, find_jsonl_files, fmt_cost, fmt_num, get_log_dirs,
+    get_opencode_files, get_record_cost, DeduplicatedRecords, PeriodAgg,
 };
 
 #[derive(Parser)]
@@ -121,10 +121,13 @@ fn main() {
         eprintln!("No Claude, Codex, OpenCode, or Pi usage data found.");
         std::process::exit(1);
     }
-    let files = find_jsonl_files(&dirs);
+    let mut files = find_jsonl_files(&dirs);
     if files.is_empty() && opencode_files.is_empty() {
         eprintln!("No usage records found.");
         std::process::exit(1);
+    }
+    if let Some(since) = cli.day.as_deref().or(cli.since.as_deref()) {
+        drop_files_modified_before(&mut files, since);
     }
 
     let hourly_mode = cli.day.is_some();

@@ -784,15 +784,22 @@ fn collect_extension_files(dir: &Path, extension: &str, out: &mut Vec<PathBuf>) 
 }
 
 pub fn iter_file_records(path: &PathBuf) -> impl Iterator<Item = RawRecord> {
-    let file = File::open(path).ok();
-    let lines: Vec<String> = match file {
-        None => vec![],
-        Some(f) => BufReader::new(f).lines().map_while(Result::ok).collect(),
+    let records = match File::open(path) {
+        Err(_) => Vec::new(),
+        Ok(f) => parse_lines(
+            BufReader::with_capacity(1 << 20, f)
+                .lines()
+                .map_while(Result::ok),
+            path.to_string_lossy().as_ref(),
+        ),
     };
-    parse_lines(lines, path.to_string_lossy().as_ref()).into_iter()
+    records.into_iter()
 }
 
-fn parse_lines(lines: Vec<String>, source_id: &str) -> Vec<RawRecord> {
+fn parse_lines(
+    lines: impl IntoIterator<Item = impl AsRef<str>>,
+    source_id: &str,
+) -> Vec<RawRecord> {
     let mut codex_model = "unknown".to_string();
     let mut codex_provider = "openai".to_string();
     let mut codex_fast = false;
@@ -800,7 +807,7 @@ fn parse_lines(lines: Vec<String>, source_id: &str) -> Vec<RawRecord> {
     let mut records = Vec::new();
 
     for (line_no, line) in lines.into_iter().enumerate() {
-        let Ok(jl) = serde_json::from_str::<JsonLine>(&line) else {
+        let Ok(jl) = serde_json::from_str::<JsonLine>(line.as_ref()) else {
             continue;
         };
         if line_no == 0 {

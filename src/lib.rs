@@ -262,12 +262,19 @@ macro_rules! price {
 }
 
 static PRICING: &[ModelPricing] = &[
+    // OpenAI GPT-6.2 — cache reads are 5% of input. Astra for Law bills as Astra.
+    price!("gpt-6.2-astra", 8.00, 40.00, 10.00, 0.40, long).fast(2.0),
+    price!("gpt-6.2-sol", 2.00, 10.00, 2.50, 0.10, long).fast(2.0),
     // OpenAI GPT-6.1 — cache reads are 5% of input, not 10%.
     price!("gpt-6.1-sol", 2.00, 10.00, 2.50, 0.10, long).fast(2.0),
     price!("gpt-6.1-terra", 1.00, 5.00, 1.25, 0.05, long).fast(2.0),
     // OpenAI GPT-6 — cache writes are 1.25x uncached input, as on GPT-5.6.
+    // Astra for Law has no cache-write charge, unlike plain Astra.
+    price!("gpt-6-astra-law", 10.00, 50.00, 10.00, 1.00, long),
     price!("gpt-6-astra", 10.00, 50.00, 12.50, 1.00, long).fast(2.0),
     price!("gpt-6-cyber", 20.00, 100.00, 25.00, 2.00, long),
+    price!("gpt-6-rosalind", 10.00, 50.00, 12.50, 1.00, long),
+    price!("gpt-rosalind-", 5.00, 25.00, 5.00, 0.50),
     price!("gpt-6-sol", 2.00, 10.00, 2.50, 0.20, long).fast(2.0),
     price!("gpt-6-luna", 0.10, 0.50, 0.125, 0.01, long).fast(2.0),
     // OpenAI GPT-5.6 — cache writes are 1.25x uncached input. Terra and Luna
@@ -291,6 +298,7 @@ static PRICING: &[ModelPricing] = &[
     // There is no plain "gpt-5.6"; an unrecognised 5.6 variant bills at Sol.
     price!("gpt-5.6", 4.00, 20.00, 5.00, 0.40, long).fast(2.0),
     // Current general models available in Codex.
+    price!("chat-latest", 5.00, 30.00, 5.00, 0.50),
     price!("gpt-5.5-cyber", 12.50, 75.00, 15.625, 1.25),
     price!("gpt-5.5-pro", 30.00, 180.00, 30.00, 30.00, long),
     price!("gpt-5.5", 5.00, 30.00, 5.00, 0.50, long).fast(2.5),
@@ -316,13 +324,13 @@ static PRICING: &[ModelPricing] = &[
     price!("codex-mini-latest", 1.50, 6.00, 1.50, 0.375),
     price!("o4-mini", 1.10, 4.40, 1.10, 0.275),
     price!("o3-pro", 20.00, 80.00, 20.00, 20.00),
-    // o3 and GPT-4.1 fast mode is 1.75x; GPT-4o is 1.7x.
+    // o3 and GPT-4.1 fast mode is 1.75x; GPT-4o is 1.7x and GPT-4o mini 5/3x.
     price!("o3", 2.00, 8.00, 2.00, 0.50).fast(1.75),
-    price!("gpt-4.1-mini", 0.40, 1.60, 0.40, 0.10),
+    price!("gpt-4.1-mini", 0.40, 1.60, 0.40, 0.10).fast(1.75),
     price!("gpt-4.1-nano", 0.10, 0.40, 0.10, 0.025),
     price!("gpt-4.1", 2.00, 8.00, 2.00, 0.50).fast(1.75),
     price!("gpt-4o-2024-05-13", 5.00, 15.00, 5.00, 5.00),
-    price!("gpt-4o-mini", 0.15, 0.60, 0.15, 0.075),
+    price!("gpt-4o-mini", 0.15, 0.60, 0.15, 0.075).fast(5.0 / 3.0),
     price!("gpt-4o", 2.50, 10.00, 2.50, 1.25).fast(1.7),
     // Open-weight; the rate depends entirely on who hosts it (roughly
     // $0.04-$0.15 in / $0.15-$0.75 out per MTok). Priced at the mid-range

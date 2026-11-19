@@ -1174,10 +1174,15 @@ pub fn dedup_key(r: &RawRecord) -> Option<(String, String)> {
     }
 }
 
-/// Parses each file on a worker thread; results keep the input order so
-/// deduplication stays deterministic.
+/// Parses each file on a worker thread, largest first so the biggest file
+/// doesn't start last; results keep the input order so deduplication stays
+/// deterministic.
 fn parse_files_in_parallel(files: &[PathBuf]) -> Vec<Vec<RawRecord>> {
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let mut largest_first: Vec<usize> = (0..files.len()).collect();
+    largest_first.sort_by_cached_key(|&index| {
+        std::cmp::Reverse(std::fs::metadata(&files[index]).map_or(0, |meta| meta.len()))
+    });
     let next = AtomicUsize::new(0);
     let mut results: Vec<Vec<RawRecord>> = Vec::new();
     results.resize_with(files.len(), Vec::new);
@@ -1187,11 +1192,11 @@ fn parse_files_in_parallel(files: &[PathBuf]) -> Vec<Vec<RawRecord>> {
                 scope.spawn(|| {
                     let mut out = Vec::new();
                     loop {
-                        let index = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(path) = files.get(index) else {
+                        let Some(&index) = largest_first.get(next.fetch_add(1, Ordering::Relaxed))
+                        else {
                             break;
                         };
-                        out.push((index, iter_file_records(path).collect()));
+                        out.push((index, iter_file_records(&files[index]).collect()));
                     }
                     out
                 })

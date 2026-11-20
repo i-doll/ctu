@@ -786,28 +786,28 @@ fn collect_extension_files(dir: &Path, extension: &str, out: &mut Vec<PathBuf>) 
 pub fn iter_file_records(path: &PathBuf) -> impl Iterator<Item = RawRecord> {
     let records = match File::open(path) {
         Err(_) => Vec::new(),
-        Ok(f) => parse_lines(
-            BufReader::with_capacity(1 << 20, f)
-                .lines()
-                .map_while(Result::ok),
+        Ok(f) => parse_reader(
+            BufReader::with_capacity(1 << 20, f),
             path.to_string_lossy().as_ref(),
         ),
     };
     records.into_iter()
 }
 
-fn parse_lines(
-    lines: impl IntoIterator<Item = impl AsRef<str>>,
-    source_id: &str,
-) -> Vec<RawRecord> {
+fn parse_reader(mut reader: impl BufRead, source_id: &str) -> Vec<RawRecord> {
     let mut codex_model = "unknown".to_string();
     let mut codex_provider = "openai".to_string();
     let mut codex_fast = false;
     let mut pi_session = false;
     let mut records = Vec::new();
 
-    for (line_no, line) in lines.into_iter().enumerate() {
-        let Ok(jl) = serde_json::from_str::<JsonLine>(line.as_ref()) else {
+    let mut line = Vec::new();
+    for line_no in 0.. {
+        line.clear();
+        if !matches!(reader.read_until(b'\n', &mut line), Ok(n) if n > 0) {
+            break;
+        }
+        let Ok(jl) = serde_json::from_slice::<JsonLine>(&line) else {
             continue;
         };
         if line_no == 0 {
@@ -1249,6 +1249,10 @@ impl DeduplicatedRecords {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_lines(lines: Vec<String>, source_id: &str) -> Vec<RawRecord> {
+        parse_reader(lines.join("\n").as_bytes(), source_id)
+    }
 
     fn assert_close(actual: f64, expected: f64) {
         assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");

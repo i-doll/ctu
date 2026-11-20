@@ -786,10 +786,14 @@ fn collect_extension_files(dir: &Path, extension: &str, out: &mut Vec<PathBuf>) 
 pub fn iter_file_records(path: &PathBuf) -> impl Iterator<Item = RawRecord> {
     let records = match File::open(path) {
         Err(_) => Vec::new(),
-        Ok(f) => parse_reader(
-            BufReader::with_capacity(1 << 20, f),
-            path.to_string_lossy().as_ref(),
-        ),
+        // A log truncated while mapped would crash the scan; the harnesses only append.
+        Ok(f) => match unsafe { memmap2::Mmap::map(&f) } {
+            Ok(map) => parse_reader(&map[..], path.to_string_lossy().as_ref()),
+            Err(_) => parse_reader(
+                BufReader::with_capacity(1 << 20, f),
+                path.to_string_lossy().as_ref(),
+            ),
+        },
     };
     records.into_iter()
 }

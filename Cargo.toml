@@ -18,3 +18,4 @@ rusqlite      = { version = "=0.39.0", features = ["bundled"] }
 clap          = { version = "4", features = ["derive"] }
 is-terminal   = "0.4"
 terminal_size = "0.3"
+memmap2       = "0.9"

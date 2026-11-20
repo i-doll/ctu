@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -788,30 +787,29 @@ pub fn iter_file_records(path: &PathBuf) -> impl Iterator<Item = RawRecord> {
         Err(_) => Vec::new(),
         // A log truncated while mapped would crash the scan; the harnesses only append.
         Ok(f) => match unsafe { memmap2::Mmap::map(&f) } {
-            Ok(map) => parse_reader(&map[..], path.to_string_lossy().as_ref()),
-            Err(_) => parse_reader(
-                BufReader::with_capacity(1 << 20, f),
-                path.to_string_lossy().as_ref(),
-            ),
+            Ok(map) => parse_bytes(&map, path.to_string_lossy().as_ref()),
+            Err(_) => match std::fs::read(path) {
+                Ok(data) => parse_bytes(&data, path.to_string_lossy().as_ref()),
+                Err(_) => Vec::new(),
+            },
         },
     };
     records.into_iter()
 }
 
-fn parse_reader(mut reader: impl BufRead, source_id: &str) -> Vec<RawRecord> {
+fn parse_bytes(data: &[u8], source_id: &str) -> Vec<RawRecord> {
     let mut codex_model = "unknown".to_string();
     let mut codex_provider = "openai".to_string();
     let mut codex_fast = false;
     let mut pi_session = false;
     let mut records = Vec::new();
 
-    let mut line = Vec::new();
-    for line_no in 0.. {
-        line.clear();
-        if !matches!(reader.read_until(b'\n', &mut line), Ok(n) if n > 0) {
-            break;
-        }
-        let Ok(jl) = serde_json::from_slice::<JsonLine>(&line) else {
+    let mut start = 0;
+    let line_ends = memchr::memchr_iter(b'\n', data).chain(std::iter::once(data.len()));
+    for (line_no, end) in line_ends.enumerate() {
+        let line = &data[start..end];
+        start = end + 1;
+        let Ok(jl) = serde_json::from_slice::<JsonLine>(line) else {
             continue;
         };
         if line_no == 0 {
@@ -1255,7 +1253,7 @@ mod tests {
     use super::*;
 
     fn parse_lines(lines: Vec<String>, source_id: &str) -> Vec<RawRecord> {
-        parse_reader(lines.join("\n").as_bytes(), source_id)
+        parse_bytes(lines.join("\n").as_bytes(), source_id)
     }
 
     fn assert_close(actual: f64, expected: f64) {
